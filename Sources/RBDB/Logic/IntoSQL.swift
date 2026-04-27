@@ -51,6 +51,30 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 		var srcColumnName: String
 	}
 
+	func termToSQL(_ term: Term, _ cols: [Var: SQLVarRef]) -> SQLExpression {
+		switch term {
+		case .boolean(let b): return b ? "true" : "false"
+		case .number(let n): return String(n)
+		case .string(let s): return "'\(s)'"
+		case .variable(let v):
+			guard let col = cols[v] else {
+				preconditionFailure("Variable \(v) not found in column mapping")
+			}
+			return "[\(col.srcTableName)].\(col.srcColumnName)"
+		case .expression(let expr):
+			switch expr {
+			case .add(let lhs, let rhs):
+				return "(\(termToSQL(lhs, cols)) + \(termToSQL(rhs, cols)))"
+			case .subtract(let lhs, let rhs):
+				return "(\(termToSQL(lhs, cols)) - \(termToSQL(rhs, cols)))"
+			case .multiply(let lhs, let rhs):
+				return "(\(termToSQL(lhs, cols)) * \(termToSQL(rhs, cols)))"
+			case .divide(let lhs, let rhs):
+				return "(\(termToSQL(lhs, cols)) / \(termToSQL(rhs, cols)))"
+			}
+		}
+	}
+
 	// Must be a valid, canonical formula (e.g. passes `validate` and has had `canonicalize` called)
 	func reduce(_ prev: SQLSelect, _ formula: Formula) throws -> SQLSelect {
 		var sql = prev
@@ -72,21 +96,26 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 				let columnNames = try getColumnNames(predicate.name)
 
 				for (i, term) in predicate.arguments.enumerated() {
-					// FIXME: I think other types of terms need to go into the WHERE clause
-					guard case .variable(let v) = term else { continue }
-
-					// If this variable was seen before, create a join condition
-					if let existingRef = cols[v] {
-						// This variable appears in multiple tables - create join condition
-						let condition =
-							"[\(existingRef.srcTableName)].\(existingRef.srcColumnName) = [\(table.effectiveName)].\(columnNames[i])"
+					switch term {
+					case .variable(let v):
+						// If this variable was seen before, create a join condition
+						if let existingRef = cols[v] {
+							// This variable appears in multiple tables - create join condition
+							let condition =
+								"[\(existingRef.srcTableName)].\(existingRef.srcColumnName) = [\(table.effectiveName)].\(columnNames[i])"
+							sql.fromTables[index].conditions.append(condition)
+						} else {
+							// First occurrence of this variable
+							cols[v] = SQLVarRef(
+								srcTableName: table.effectiveName,
+								srcColumnName: columnNames[i]
+							)
+						}
+					case .boolean, .number, .string, .expression:
+						// Add to the WHERE clause
+						let sqlExpr = termToSQL(term, cols)
+						let condition = "[\(table.effectiveName)].\(columnNames[i]) = \(sqlExpr)"
 						sql.fromTables[index].conditions.append(condition)
-					} else {
-						// First occurrence of this variable
-						cols[v] = SQLVarRef(
-							srcTableName: table.effectiveName,
-							srcColumnName: columnNames[i]
-						)
 					}
 				}
 			}
@@ -94,17 +123,7 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 			// Generate SELECT clause based on the head predicate
 			let columnNames = try getColumnNames(positive.name)
 			for (i, term) in positive.arguments.enumerated() {
-				var value: SQLExpression
-				switch term {
-				case .boolean(let b): value = b ? "true" : "false"
-				case .number(let n): value = String(n)
-				case .string(let s): value = s
-				case .variable(let v):
-					guard let col = cols[v] else {
-						preconditionFailure("All terms in the head must also appear in the body")
-					}
-					value = "[\(col.srcTableName)].\(col.srcColumnName)"
-				}
+				let value = termToSQL(term, cols)
 				sql.select.append("\(value) AS \(columnNames[i])")
 			}
 		}
@@ -114,6 +133,33 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 
 fileprivate struct QueryIntoSQLReducer: SymbolReducer {
 	let getColumnNames: (_ predicateName: String) throws -> [String]
+
+	func termToSQL(_ term: Term, _ table: SQLTable, _ columnName: String)
+		-> SQLExpression
+	{
+		switch term {
+		case .boolean(let b): return b ? "true" : "false"
+		case .number(let n): return String(n)
+		case .string(let s): return "'\(s)'"
+		case .variable:
+			return "[\(table.effectiveName)].\(columnName)"
+		case .expression(let expr):
+			switch expr {
+			case .add(let lhs, let rhs):
+				return
+					"(\(termToSQL(lhs, table, columnName)) + \(termToSQL(rhs, table, columnName)))"
+			case .subtract(let lhs, let rhs):
+				return
+					"(\(termToSQL(lhs, table, columnName)) - \(termToSQL(rhs, table, columnName)))"
+			case .multiply(let lhs, let rhs):
+				return
+					"(\(termToSQL(lhs, table, columnName)) * \(termToSQL(rhs, table, columnName)))"
+			case .divide(let lhs, let rhs):
+				return
+					"(\(termToSQL(lhs, table, columnName)) / \(termToSQL(rhs, table, columnName)))"
+			}
+		}
+	}
 
 	func reduce(_ prev: SQLSelect, _ formula: Formula) throws -> SQLSelect {
 		var sql = prev
@@ -129,19 +175,17 @@ fileprivate struct QueryIntoSQLReducer: SymbolReducer {
 
 			// Process arguments to build variable mappings and WHERE conditions for constants
 			for (i, term) in predicate.arguments.enumerated() {
+				let columnName = columnNames[i]
 				switch term {
 				case .variable(let v):
 					// Variables become part of the result set
 					// FIXME: Prevent SQL injection via variable name
-					sql.select.append("[\(table.effectiveName)].\(columnNames[i]) AS [\(v)]")
-				case .boolean(let b):
-					let value = b ? "true" : "false"
-					table.conditions.append("[\(table.effectiveName)].\(columnNames[i]) = \(value)")
-				case .number(let n):
-					table.conditions.append("[\(table.effectiveName)].\(columnNames[i]) = \(n)")
-				case .string(let s):
-					// FIXME: Prevent SQL injection
-					table.conditions.append("[\(table.effectiveName)].\(columnNames[i]) = '\(s)'")
+					sql.select.append("[\(table.effectiveName)].\(columnName) AS [\(v)]")
+				case .boolean, .number, .string, .expression:
+					// Expressions in queries go into WHERE clause
+					let sqlExpr = termToSQL(term, table, columnName)
+					table.conditions.append(
+						"[\(table.effectiveName)].\(columnName) = \(sqlExpr)")
 				}
 			}
 

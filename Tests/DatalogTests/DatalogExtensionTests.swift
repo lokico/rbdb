@@ -111,4 +111,26 @@ struct DatalogExtensionTests {
 
 		#expect(noRows.count == 0, "Should return no rows for non-existent user")
 	}
+
+	@Test("recursive natural number with arithmetic")
+	func recursiveNaturalNumber() async throws {
+		let db = try RBDB(path: ":memory:")
+
+		try db.query(sql: "CREATE TABLE nat(n)")
+
+		// Assert that 0 is a natural number
+		try db.assert(datalog: "nat(0)")
+
+		// Assert recursive rule: nat(X + 1) :- nat(X)
+		// This defines that if X is a natural number, then X+1 is also a natural number
+		try db.assert(datalog: "nat(X + 1) :- nat(X)")
+
+		// Query for a large natural number (e.g., 100)
+		// This should work through recursive inference: 0 -> 1 -> 2 -> ... -> 100
+		let results = try db.query(datalog: "nat(100)")
+		let rows = Array(results)
+
+		#expect(rows.count == 1, "Should infer that 100 is a natural number")
+		#expect(rows[0]["sat"] as? Int64 == 1, "Query should be satisfied")
+	}
 }

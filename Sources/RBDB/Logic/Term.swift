@@ -1,3 +1,19 @@
+public enum Expression: Codable, Comparable {
+	case add(Term, Term)
+	case subtract(Term, Term)
+	case multiply(Term, Term)
+	case divide(Term, Term)
+
+	public var op: String {
+		switch self {
+		case .add: "+"
+		case .subtract: "-"
+		case .multiply: "*"
+		case .divide: "/"
+		}
+	}
+}
+
 public enum Term: Symbol {
 	case variable(Var)
 
@@ -6,10 +22,14 @@ public enum Term: Symbol {
 	case number(Float)
 	case string(String)
 
+	// expressions
+	indirect case expression(Expression)
+
 	public var type: SymbolType {
 		switch self {
 		case .variable: .variable
 		case .boolean, .number, .string: .constant
+		case .expression: .expression
 		}
 	}
 
@@ -26,22 +46,52 @@ public enum Term: Symbol {
 extension SymbolRewriter {
 	public func rewrite(term: Term) -> Term {
 		switch term {
-		case .variable(let v): .variable(rewrite(variable: v))
-		default: term
+		case .variable(let v):
+			.variable(rewrite(variable: v))
+		case .expression(let expr):
+			.expression(rewrite(expression: expr))
+		default:
+			term
 		}
 	}
 	public func rewrite(variable: Var) -> Var { variable }
+	public func rewrite(expression: Expression) -> Expression {
+		switch expression {
+		case .add(let lhs, let rhs):
+			.add(rewrite(term: lhs), rewrite(term: rhs))
+		case .subtract(let lhs, let rhs):
+			.subtract(rewrite(term: lhs), rewrite(term: rhs))
+		case .multiply(let lhs, let rhs):
+			.multiply(rewrite(term: lhs), rewrite(term: rhs))
+		case .divide(let lhs, let rhs):
+			.divide(rewrite(term: lhs), rewrite(term: rhs))
+		}
+	}
 }
 
 extension SymbolReducer {
 	public func reduce(_ prev: Result, _ term: Term) throws -> Result {
-		if case let .variable(v) = term {
+		switch term {
+		case .variable(let v):
 			return try reduce(prev, v)
+		case .expression(let expr):
+			return try reduce(prev, expr)
+		default:
+			return prev
 		}
-		return prev
 	}
 
 	public func reduce(_ prev: Result, _ variable: Var) throws -> Result { prev }
+	public func reduce(_ prev: Result, _ expression: Expression) throws -> Result {
+		switch expression {
+		case .add(let lhs, let rhs),
+			.subtract(let lhs, let rhs),
+			.multiply(let lhs, let rhs),
+			.divide(let lhs, let rhs):
+			let result = try reduce(prev, lhs)
+			return try reduce(result, rhs)
+		}
+	}
 }
 
 extension Term: Codable {
@@ -85,6 +135,8 @@ extension Term: Codable {
 						)
 					)
 				}
+			case .expression:
+				self = .expression(try container.decode(Expression.self, forKey: key))
 			default:
 				// should never get here
 				fatalError()
@@ -116,6 +168,7 @@ extension Term: Codable {
 		case .boolean(let value): try container.encode(value, forKey: .constant)
 		case .number(let value): try container.encode(value, forKey: .constant)
 		case .string(let value): try container.encode(value, forKey: .constant)
+		case .expression(let expr): try container.encode(expr, forKey: .expression)
 		}
 	}
 }
