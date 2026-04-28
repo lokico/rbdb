@@ -198,11 +198,13 @@ public class RBDB: SQLiteDatabase {
 		try? createViewAndTrigger(
 			for: createTable.tableName,
 			columns: createTable.columnNames,
-			rules: [] // We know there can't be any rules yet since the table didn't exist before
+			rules: []  // We know there can't be any rules yet since the table didn't exist before
 		)
 	}
 
-	private func createViewAndTrigger<T: StringProtocol>(for tableName: T, columns: [String], rules: [Formula])
+	private func createViewAndTrigger<T: StringProtocol>(
+		for tableName: T, columns: [String], rules: [Formula]
+	)
 		throws
 	{
 		let columnList = columns.map { "[\($0)]" }.joined(separator: ", ")
@@ -246,7 +248,8 @@ public class RBDB: SQLiteDatabase {
 		}
 
 		let unionedSelects = selects.joined(separator: "\nUNION\n")
-		let createViewSQL = "CREATE TEMP VIEW IF NOT EXISTS \(tableName) (\(columnList)) AS \(unionedSelects)"
+		let createViewSQL =
+			"CREATE TEMP VIEW IF NOT EXISTS \(tableName) (\(columnList)) AS \(unionedSelects)"
 
 		try super.query(sql: SQL(createViewSQL))
 
@@ -323,11 +326,11 @@ public class RBDB: SQLiteDatabase {
 
 		let retrySQL: SQL
 		if rules.contains(where: { $0.isRecursive(for: predicateName) }) {
-			// Recursion + arithmetic in head expressions can be unbounded under naive
-			// fixed-point evaluation. Rather than create a view (which SQLite would
-			// fully materialize and never terminate), inline a `WITH RECURSIVE` CTE
-			// that shadows the missing name and pushes equality constraints from the
-			// failing statement's WHERE clause into the recursive step as bounds.
+			// Ideally, we could just use a `WITH RECURSIVE` CTE in our view in `createViewAndTrigger`,
+			// but SQLite won't push down WHERE clause conditions into the recursive part of the CTE,
+			// which means the recursion wouldn't terminate. Instead, we build a custom CTE on the fly
+			// that includes the specific bounds derived from the query's WHERE clause.
+			// See https://github.com/sqlite/sqlite/blob/6176034151d10b29a38b0e67f27818a719c68139/src/select.c#L5054
 			retrySQL = try inlineBoundedCTE(
 				predicateName: String(predicateName),
 				columnNames: columnNames,
@@ -357,7 +360,7 @@ public class RBDB: SQLiteDatabase {
 				let data = json.data(using: .utf8)
 			else {
 				throw RBDBError.corruptData(
-						message: "expected json stored as UTF-8 in _rule.formula")
+					message: "expected json stored as UTF-8 in _rule.formula")
 			}
 			rules.append(try decoder.decode(Formula.self, from: data))
 		}
