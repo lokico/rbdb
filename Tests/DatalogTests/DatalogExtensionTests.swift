@@ -133,4 +133,39 @@ struct DatalogExtensionTests {
 		#expect(rows.count == 1, "Should infer that 100 is a natural number")
 		#expect(rows[0]["sat"] as? Int64 == 1, "Query should be satisfied")
 	}
+
+	@Test("recursive arithmetic terminates without spurious matches")
+	func recursiveNaturalNumberMiss() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE evens(n)")
+		try db.assert(datalog: "evens(0)")
+		try db.assert(datalog: "evens(X + 2) :- evens(X)")
+
+		let hit = Array(try db.query(datalog: "evens(50)"))
+		#expect(hit.count == 1, "50 is even")
+
+		let miss = Array(try db.query(datalog: "evens(51)"))
+		#expect(miss.count == 0, "51 is not even")
+	}
+
+	@Test("arithmetic expressions in rule heads")
+	func arithmeticInRuleHeads() async throws {
+		let db = try RBDB(path: ":memory:")
+
+		try db.query(sql: "CREATE TABLE base(n)")
+		try db.query(sql: "CREATE TABLE doubled(n)")
+
+		try db.assert(datalog: "base(5)")
+		try db.assert(datalog: "base(10)")
+
+		// Rule using an arithmetic expression in the head
+		try db.assert(datalog: "doubled(X * 2) :- base(X)")
+
+		let hit = Array(try db.query(datalog: "doubled(20)"))
+		#expect(hit.count == 1, "doubled(20) should follow from base(10)")
+		#expect(hit[0]["sat"] as? Int64 == 1)
+
+		let miss = Array(try db.query(datalog: "doubled(7)"))
+		#expect(miss.count == 0, "doubled(7) should not be derivable")
+	}
 }

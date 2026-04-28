@@ -71,11 +71,9 @@ public class RBDB: SQLiteDatabase {
 			// Only attempt to rescue if we have an index to resume from, so
 			//  we don't risk re-executing any potentially non-idempotent commands.
 			if case .queryError(_, let index) = error, let index = index,
-				try rescue(error: error)
+				let cursor = try rescue(error: error, in: sql, at: index)
 			{
-				// Don't do `super.query` here because we want to continue rescuing
-				//  the remainder of the query..
-				return try query(sql: sql.at(startIndex: index))
+				return cursor
 			}
 			throw error
 		}
@@ -199,11 +197,12 @@ public class RBDB: SQLiteDatabase {
 		// If this fails, ignore the error - rescue will handle it later when needed
 		try? createViewAndTrigger(
 			for: createTable.tableName,
-			columns: createTable.columnNames
+			columns: createTable.columnNames,
+			rules: [] // We know there can't be any rules yet since the table didn't exist before
 		)
 	}
 
-	private func createViewAndTrigger<T: StringProtocol>(for tableName: T, columns: [String])
+	private func createViewAndTrigger<T: StringProtocol>(for tableName: T, columns: [String], rules: [Formula])
 		throws
 	{
 		let columnList = columns.map { "[\($0)]" }.joined(separator: ", ")
@@ -229,66 +228,25 @@ public class RBDB: SQLiteDatabase {
 			"""
 		]
 
-		let rules = try super.query(
-			sql: """
-				SELECT json(formula) as json
-				FROM _rule
-				WHERE negative_literal_count > 0
-				  AND output_type = \("@\(tableName)")
-				""")
-
-		let decoder = JSONDecoder()
-		var hasRecursiveRule = false
-
-		for row in rules {
-			if let json = row["json"] as? String {
-				guard let jsonData = json.data(using: .utf8) else {
+		for rule in rules {
+			var columnsQuery: SQLiteCursor? = nil
+			let ruleSQL = try rule.ruleIntoSQL({ predicateName in
+				guard
+					let columns = try self.getColumns(
+						for: predicateName, query: &columnsQuery)
+				else {
 					throw RBDBError.corruptData(
-						message: "expected json stored as UTF-8 in _rule.formula")
-				}
-				let rule = try decoder.decode(Formula.self, from: jsonData)
-
-				var columnsQuery: SQLiteCursor? = nil
-				let ruleSQL = try rule.ruleIntoSQL({ predicateName in
-					guard
-						let columns = try self.getColumns(
-							for: predicateName, query: &columnsQuery)
-					else {
-						throw RBDBError.corruptData(
-							message:
-								"table '\(tableName)' references unknown predicate '\(predicateName)'"
-						)
-					}
-					return columns
-				})
-
-				// Check if this rule is recursive (references the same predicate in its body)
-				if rule.isRecursive(for: tableName) {
-					hasRecursiveRule = true
-					// Replace the table name with the CTE name in recursive references
-					selects.append(
-						ruleSQL.replacingOccurrences(of: "[\(tableName)]", with: "\(tableName)_rec")
+						message:
+							"table '\(tableName)' references unknown predicate '\(predicateName)'"
 					)
-				} else {
-					selects.append(ruleSQL)
 				}
-			}
+				return columns
+			})
+			selects.append(ruleSQL)
 		}
 
-		let createViewSQL: String
 		let unionedSelects = selects.joined(separator: "\nUNION\n")
-		if hasRecursiveRule {
-			createViewSQL = """
-				CREATE TEMP VIEW IF NOT EXISTS \(tableName) (\(columnList)) AS
-				WITH RECURSIVE \(tableName)_rec (\(columnList)) AS (
-				\(unionedSelects)
-				)
-				SELECT * FROM \(tableName)_rec
-				"""
-		} else {
-			createViewSQL =
-				"CREATE TEMP VIEW IF NOT EXISTS \(tableName) (\(columnList)) AS \(unionedSelects)"
-		}
+		let createViewSQL = "CREATE TEMP VIEW IF NOT EXISTS \(tableName) (\(columnList)) AS \(unionedSelects)"
 
 		try super.query(sql: SQL(createViewSQL))
 
@@ -351,15 +309,209 @@ public class RBDB: SQLiteDatabase {
 		return columnNames
 	}
 
-	private func rescue(error: SQLiteError) throws -> Bool {
-		if case .queryError(let msg, _) = error,
+	private func rescue(error: SQLiteError, in sql: SQL, at startIndex: SQL.Index) throws
+		-> SQLiteCursor?
+	{
+		guard case .queryError(let msg, _) = error,
 			let match = msg.firstMatch(of: /no such table: ([^\s]+)/),
 			let columnNames = try getColumns(for: match.1)
-		{
-			try createViewAndTrigger(for: match.1, columns: columnNames)
-			return true
+		else {
+			return nil
 		}
-		return false
+		let predicateName = match.1
+		let rules = try fetchRules(for: predicateName)
+
+		let retrySQL: SQL
+		if rules.contains(where: { $0.isRecursive(for: predicateName) }) {
+			// Recursion + arithmetic in head expressions can be unbounded under naive
+			// fixed-point evaluation. Rather than create a view (which SQLite would
+			// fully materialize and never terminate), inline a `WITH RECURSIVE` CTE
+			// that shadows the missing name and pushes equality constraints from the
+			// failing statement's WHERE clause into the recursive step as bounds.
+			retrySQL = try inlineBoundedCTE(
+				predicateName: String(predicateName),
+				columnNames: columnNames,
+				rules: rules,
+				sql: sql,
+				startIndex: startIndex
+			)
+		} else {
+			try createViewAndTrigger(for: predicateName, columns: columnNames, rules: rules)
+			retrySQL = sql.at(startIndex: startIndex)
+		}
+		return try query(sql: retrySQL)
+	}
+
+	private func fetchRules<S: StringProtocol>(for predicateName: S) throws -> [Formula] {
+		let cursor = try super.query(
+			sql: """
+				SELECT json(formula) as json
+				FROM _rule
+				WHERE negative_literal_count > 0
+				  AND output_type = \("@\(predicateName)")
+				""")
+		let decoder = JSONDecoder()
+		var rules: [Formula] = []
+		for row in cursor {
+			guard let json = row["json"] as? String,
+				let data = json.data(using: .utf8)
+			else {
+				throw RBDBError.corruptData(
+						message: "expected json stored as UTF-8 in _rule.formula")
+			}
+			rules.append(try decoder.decode(Formula.self, from: data))
+		}
+		return rules
+	}
+
+	/// Builds a SQL with a `WITH RECURSIVE [predicateName](cols) AS (...)` clause prepended to
+	/// the failing statement (starting at `startIndex` in the original SQL). The CTE shadows the
+	/// view that would otherwise be created. For each recursive rule whose head expression is a
+	/// known monotonic function of a body variable bound to a constrained column in the user's
+	/// WHERE clause, we wrap the rule SQL in a subquery and add the corresponding upper/lower
+	/// bound — that is what makes the recursion terminate.
+	private func inlineBoundedCTE(
+		predicateName: String,
+		columnNames: [String],
+		rules: [Formula],
+		sql: SQL,
+		startIndex: SQL.Index
+	) throws -> SQL {
+		let stmt = String(sql.queryText.utf8.dropFirst(startIndex.queryOffset))!
+		let constraints = extractEqualityConstraints(
+			from: stmt, predicateName: predicateName, columnNames: columnNames)
+
+		let columnList = columnNames.map { "[\($0)]" }.joined(separator: ", ")
+
+		// Base case: facts (formulas with no negative literals for this predicate).
+		var factSelectList: [String] = []
+		factSelectList.reserveCapacity(columnNames.count)
+		for i in 1...columnNames.count {
+			switch i {
+			case 1...2: factSelectList.append("arg\(i)_constant")
+			default: factSelectList.append("json_extract(formula, '$[1][\(i-1)].\"\"')")
+			}
+		}
+		var selects = [
+			"""
+			SELECT \(factSelectList.joined(separator: ", "))
+			FROM _rule
+			WHERE output_type = '@\(predicateName)'
+			  AND negative_literal_count = 0
+			"""
+		]
+
+		var columnsQuery: SQLiteCursor? = nil
+		let getCols: (String) throws -> [String] = { name in
+			guard let cols = try self.getColumns(for: name, query: &columnsQuery) else {
+				throw RBDBError.corruptData(
+					message: "rule for '\(predicateName)' references unknown predicate '\(name)'")
+			}
+			return cols
+		}
+
+		for rule in rules {
+			let ruleSQL = try rule.ruleIntoSQL(getCols)
+			var finalSQL = ruleSQL
+			if rule.isRecursive(for: predicateName),
+				let bounds = boundsForRecursiveStep(
+					rule: rule,
+					predicateName: predicateName,
+					columnNames: columnNames,
+					constraints: constraints)
+			{
+				// SQLite forbids referencing a recursive CTE from inside a subquery, so we can't
+				//  wrap the rule SQL — inject the bound conditions directly. The rule SQL never
+				//  contains a WHERE today (RuleIntoSQLReducer only puts conditions on JOIN ON
+				//  clauses), but be defensive in case that changes.
+				let connector =
+					ruleSQL.range(of: " WHERE ", options: .caseInsensitive) != nil
+					? " AND " : " WHERE "
+				finalSQL = ruleSQL + connector + bounds.joined(separator: " AND ")
+			}
+			selects.append(finalSQL)
+		}
+
+		let cte = """
+			WITH RECURSIVE [\(predicateName)] (\(columnList)) AS (
+			\(selects.joined(separator: "\nUNION\n"))
+			)
+			"""
+		return SQL(
+			"\(cte)\n\(stmt)", arguments: Array(sql.arguments.dropFirst(startIndex.argumentIndex)))
+	}
+
+	/// Returns SQL bounds (e.g. `[n] <= 100`) to add to a recursive rule's step, derived from the
+	/// query's equality constraints and the head expression's monotonicity in the body variables.
+	/// Returns nil if no usable bound was found — the caller will leave the rule unconstrained.
+	private func boundsForRecursiveStep(
+		rule: Formula,
+		predicateName: String,
+		columnNames: [String],
+		constraints: [String: String]
+	) -> [String]? {
+		guard !constraints.isEmpty,
+			case .hornClause(let head, let bodies) = rule
+		else { return nil }
+
+		let recursiveVars: Set<Var> =
+			bodies
+			.filter { $0.name == predicateName }
+			.flatMap(\.arguments)
+			.compactMap { if case .variable(let v) = $0 { v } else { nil } }
+			.reduce(into: []) { $0.insert($1) }
+
+		var bounds: [String] = []
+		for (colIdx, headTerm) in head.arguments.enumerated()
+		where colIdx < columnNames.count {
+			let colName = columnNames[colIdx]
+			guard let bound = constraints[colName] else { continue }
+			let usedVars = headTerm.freeVariables
+			guard !usedVars.isEmpty, usedVars.allSatisfy({ recursiveVars.contains($0) }) else {
+				continue
+			}
+			var common = 0
+			var ok = true
+			for v in usedVars {
+				let m = headTerm.monotonicity(in: v)
+				if m == 0 {
+					ok = false
+					break
+				}
+				if common == 0 {
+					common = m
+				} else if common != m {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				bounds.append("[\(colName)] \(common > 0 ? "<=" : ">=") \(bound)")
+			}
+		}
+		return bounds.isEmpty ? nil : bounds
+	}
+
+	/// Best-effort extraction of `[predicate].column = literal` style equality constraints from
+	/// the failing statement text. Handles the form generated by `queryIntoSQL` and common
+	/// hand-written variants. Returns map of column name → literal SQL expression.
+	private func extractEqualityConstraints(
+		from stmt: String, predicateName: String, columnNames: [String]
+	) -> [String: String] {
+		var result: [String: String] = [:]
+		let escName = NSRegularExpression.escapedPattern(for: predicateName)
+		for col in columnNames {
+			let escCol = NSRegularExpression.escapedPattern(for: col)
+			let pattern =
+				"\\[?\\s*\(escName)\\s*\\]?\\s*\\.\\s*\\[?\\s*\(escCol)\\s*\\]?\\s*=\\s*(-?\\d+(?:\\.\\d+)?|'[^']*'|true|false)"
+			guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+				let match = regex.firstMatch(
+					in: stmt, range: NSRange(stmt.startIndex..., in: stmt)),
+				let valueRange = Range(match.range(at: 1), in: stmt)
+			else { continue }
+			result[col] = String(stmt[valueRange])
+		}
+		return result
 	}
 }
 

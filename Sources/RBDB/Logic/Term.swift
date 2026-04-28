@@ -69,6 +69,46 @@ extension SymbolRewriter {
 	}
 }
 
+extension Term {
+	/// Variables appearing free in this term.
+	public var freeVariables: Set<Var> {
+		switch self {
+		case .variable(let v): [v]
+		case .boolean, .number, .string: []
+		case .expression(let expr):
+			switch expr {
+			case .add(let l, let r), .subtract(let l, let r),
+				.multiply(let l, let r), .divide(let l, let r):
+				l.freeVariables.union(r.freeVariables)
+			}
+		}
+	}
+
+	/// Returns +1 if this term is monotonically non-decreasing in `variable`,
+	/// -1 if non-increasing, 0 if non-monotonic / unknown / independent.
+	/// Only handles `+ const` and `- const` with simple constants.
+	public func monotonicity(in variable: Var) -> Int {
+		switch self {
+		case .variable(let v): v == variable ? 1 : 0
+		case .boolean, .number, .string: 0
+		case .expression(let expr):
+			switch expr {
+			case .add(let l, let r):
+				combineMonotonicity(l.monotonicity(in: variable), r.monotonicity(in: variable))
+			case .subtract(let l, let r):
+				combineMonotonicity(l.monotonicity(in: variable), -r.monotonicity(in: variable))
+			case .multiply, .divide: 0
+			}
+		}
+	}
+}
+
+private func combineMonotonicity(_ a: Int, _ b: Int) -> Int {
+	if a == 0 { return b }
+	if b == 0 { return a }
+	return a == b ? a : 0
+}
+
 extension SymbolReducer {
 	public func reduce(_ prev: Result, _ term: Term) throws -> Result {
 		switch term {

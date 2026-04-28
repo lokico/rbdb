@@ -269,7 +269,9 @@ extension Conversions {
 
 		@inlinable
 		public func unapply(_ output: T) throws -> (T, [T]) {
-			let initial = try combine.unapply(output)
+			guard let initial = try? combine.unapply(output) else {
+				return (output, [])
+			}
 			var fst = initial.0
 			var arr = [initial.1]
 
