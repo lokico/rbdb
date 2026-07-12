@@ -17,7 +17,7 @@ dependencies: [
 ```
 ### SQLite Dependency
 
-RBDB requires a SQLite library built with `SQLITE_ENABLE_NORMALIZE`. The system SQLite on macOS 26 is known to work. Otherwise, you'll need to build SQLite and supply a module map (see Dockerfile for an example).
+RBDB requires SQLite 3.45.0 or newer built with `SQLITE_ENABLE_NORMALIZE` and `SQLITE_ENABLE_MATH_FUNCTIONS`. The system SQLite on macOS 26 is known to work. Otherwise, you'll need to build SQLite and supply a module map (see Dockerfile for an example).
 
 ## Usage
 
@@ -34,24 +34,27 @@ try db.query(sql: "CREATE TABLE user(name)")
 
 ### Assert facts
 
-You can assert simple facts in three equivalent ways:
+You can assert simple facts in these equivalent ways:
 
 ```swift
 // 1. Create Formula directly
 let formula1 = Formula.predicate(Predicate(name: "user", arguments: [.string("Alice")]))
 try db.assert(formula: formula1)
 
-// 2. Parse datalog into Formula
+// 2. Parse datalog into Formula manually
 import Datalog
 let formula2 = try DatalogParser().parse("user('Alice')")
 assert(formula1 == formula2)  // true
 try db.assert(formula: formula2) // fails if formula1 was already asserted
 
-// 3. SQL INSERT
+// 3. Datalog convenience extension (requires `import Datalog`)
+try db.assert(datalog: "user('Alice')") // fails if already asserted above
+
+// 4. SQL INSERT
 try db.query(sql: "INSERT INTO user(name) VALUES ('Alice')") // fails if either formula above was already asserted
 ```
 
-All three approaches above are equivalent ways of asserting the same fact. As noted in the code comments, you can only assert a fact once. Subsequent attempts to assert an equivalent fact will trigger a unique constraint failure in the database.
+All approaches above are equivalent ways of asserting the same fact. As noted in the code comments, you can only assert a fact once. Subsequent attempts to assert an equivalent fact will trigger a unique constraint failure in the database.
 
 ### Rules
 
@@ -74,7 +77,7 @@ try db.assert(datalog: "parent('John', 'Mary')")
 try db.assert(datalog: "parent('Mary', 'Tom')")
 try db.assert(datalog: "parent('Bob', 'Alice')")
 
-// Define a rule: grandparent(X, Z) :- parent(X, Y), parent(Y, Z)
+// Define a rule: X is the grandparent of Z if X is the parent of Y and Y is the parent of Z
 try db.assert(datalog: "grandparent(X, Z) :- parent(X, Y), parent(Y, Z)")
 
 // Query back using SQL

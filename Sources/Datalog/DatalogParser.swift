@@ -93,37 +93,49 @@ extension DatalogParser {
 		additiveExpressionParser.eraseToAnyParserPrinter()
 	}
 
-	// Additive expressions: term + term, term - term
+	// Additive expressions: a chain of `+`/`-` over multiplicative terms (left-associative).
 	private var additiveExpressionParser: some ParserPrinter<Substring, Term> {
-		OneOf {
-			binaryExpressionParser(multiplicativeExpressionParser, "+", Expression.add)
-			binaryExpressionParser(multiplicativeExpressionParser, "-", Expression.subtract)
-		}
-	}
-
-	// Multiplicative expressions: term * term, term / term
-	private var multiplicativeExpressionParser: some ParserPrinter<Substring, Term> {
-		OneOf {
-			binaryExpressionParser(primaryTermParser, "*", Expression.multiply)
-			binaryExpressionParser(primaryTermParser, "/", Expression.divide)
-		}
-	}
-
-	// Multiplicative expressions: term * term, term / term
-	private func binaryExpressionParser<
-		A: ParserPrinter<Substring, Term>, O: ParserPrinter<Substring, ()>
-	>(
-		_ argParser: A,
-		_ op: O,
-		_ expr: @escaping (Term, Term) -> Expression
-	) -> some ParserPrinter<Substring, Term> {
-		ParsePrint(.leftAssociate(.case(expr).map(.case(Term.expression)))) {
-			argParser
+		ParsePrint(AdditiveFold()) {
+			multiplicativeExpressionParser
 			Whitespace()
 			Many {
-				op
+				OneOf {
+					"+".map { AddOp.plus }
+					"-".map { AddOp.minus }
+				}
 				Whitespace()
-				argParser
+				multiplicativeExpressionParser
+				Whitespace()
+			}
+		}
+	}
+
+	// Multiplicative expressions: a chain of `*`/`/` over exponential terms (left-associative).
+	private var multiplicativeExpressionParser: some ParserPrinter<Substring, Term> {
+		ParsePrint(MultiplicativeFold()) {
+			exponentialExpressionParser
+			Whitespace()
+			Many {
+				OneOf {
+					"*".map { MulOp.times }
+					"/".map { MulOp.divide }
+				}
+				Whitespace()
+				exponentialExpressionParser
+				Whitespace()
+			}
+		}
+	}
+
+	// Exponential expressions: `a ^ b ^ c` over primary terms (right-associative).
+	private var exponentialExpressionParser: some ParserPrinter<Substring, Term> {
+		ParsePrint(ExponentFold()) {
+			primaryTermParser
+			Whitespace()
+			Many {
+				"^"
+				Whitespace()
+				primaryTermParser
 				Whitespace()
 			}
 		}
@@ -192,8 +204,8 @@ extension DatalogParser {
 		}
 	}
 
-	private var numberParser: some ParserPrinter<Substring.UTF8View, Float> {
-		Float.parser()
+	private var numberParser: some ParserPrinter<Substring.UTF8View, Double> {
+		Double.parser()
 	}
 
 	private var atomParser: some ParserPrinter<Substring, String> {
@@ -282,5 +294,92 @@ extension Conversions {
 
 			return (fst, arr)
 		}
+	}
+}
+
+// MARK: - Arithmetic operator folding
+
+private enum AddOp { case plus, minus }
+private enum MulOp { case times, divide }
+
+/// Flattens a same-operator (`add` or `multiply`) chain of `Term`s into its leaves for printing.
+private func flattenChain(_ term: Term, op: Expression.Op) -> [Term] {
+	guard case .expression(let e) = term, e.operation == op else { return [term] }
+	return e.operands
+		.map {
+			flattenChain($0, op: op)
+		}
+		.reduce(into: []) {
+			$0.append(contentsOf: $1)
+		}
+}
+
+/// Parses `first (± term)*` into a canonical sum; prints a canonical sum back into that shape,
+/// rendering negative-literal addends with `-`.
+private struct AdditiveFold: Conversion {
+	func apply(_ input: (Term, [(AddOp, Term)])) throws -> Term {
+		var result = input.0
+		for (op, rhs) in input.1 {
+			switch op {
+			case .plus: result = .sum(result, rhs)
+			case .minus: result = .difference(result, rhs)
+			}
+		}
+		return result
+	}
+
+	func unapply(_ output: Term) throws -> (Term, [(AddOp, Term)]) {
+		let addends = flattenChain(output, op: .add)
+		var rest: [(AddOp, Term)] = []
+		for addend in addends.dropFirst() {
+			if case .number(let n) = addend, n < 0 {
+				rest.append((.minus, .number(-n)))
+			} else {
+				rest.append((.plus, addend))
+			}
+		}
+		return (addends[0], rest)
+	}
+}
+
+/// Parses `first (* or / term)*` into a canonical product; prints a canonical product back.
+private struct MultiplicativeFold: Conversion {
+	func apply(_ input: (Term, [(MulOp, Term)])) throws -> Term {
+		var result = input.0
+		for (op, rhs) in input.1 {
+			switch op {
+			case .times: result = .product(result, rhs)
+			case .divide: result = .quotient(result, rhs)
+			}
+		}
+		return result
+	}
+
+	func unapply(_ output: Term) throws -> (Term, [(MulOp, Term)]) {
+		let factors = flattenChain(output, op: .multiply)
+		return (factors[0], factors.dropFirst().map { (.times, $0) })
+	}
+}
+
+/// Parses `a ^ b ^ c` right-associatively into a canonical power; prints a canonical power back.
+private struct ExponentFold: Conversion {
+	func apply(_ input: (Term, [Term])) throws -> Term {
+		guard let last = input.1.last else { return input.0 }
+		var result = last
+		for base in input.1.dropLast().reversed() {
+			result = .power(base, result)
+		}
+		return .power(input.0, result)
+	}
+
+	func unapply(_ output: Term) throws -> (Term, [Term]) {
+		var chain: [Term] = []
+		var current = output
+		while case .expression(let e) = current, case .exponent(let base, let exp) = e.raw {
+			chain.append(base)
+			current = exp
+		}
+		chain.append(current)
+		return (chain[0], Array(chain.dropFirst()))
 	}
 }

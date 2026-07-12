@@ -4,9 +4,23 @@ fileprivate struct SQLTable {
 	var name: String
 	var alias: String?
 	var conditions: [SQLExpression] = []
+	/// A raw FROM-clause source (e.g. a `(SELECT …)` subquery) to use instead of the bare table
+	/// `[name]`. When set, the table is always given an alias (its `effectiveName`).
+	var source: SQLExpression?
 
 	var effectiveName: String {
 		alias ?? name
+	}
+
+	/// How this table appears in a FROM/JOIN clause.
+	var fromClause: SQLExpression {
+		if let source {
+			return "\(source) AS [\(effectiveName)]"
+		} else if let alias {
+			return "[\(name)] AS [\(alias)]"
+		} else {
+			return "[\(name)]"
+		}
 	}
 }
 
@@ -16,22 +30,13 @@ fileprivate struct SQLSelect {
 	static var empty: SQLSelect { SQLSelect(select: [], fromTables: []) }
 
 	var sql: String {
-		var result = "SELECT \(select.joined(separator: ", "))"
+		var result = "SELECT DISTINCT \(select.joined(separator: ", "))"
 
 		if let t1 = fromTables.first {
-			if let alias = t1.alias {
-				result += " FROM [\(t1.name)] AS [\(alias)]"
-			} else {
-				result += " FROM [\(t1.name)]"
-			}
+			result += " FROM \(t1.fromClause)"
 
 			for t2 in fromTables.dropFirst() {
-				if let alias = t2.alias {
-					result +=
-						" JOIN [\(t2.name)] AS [\(alias)] ON \(t2.conditions.joined(separator: " AND "))"
-				} else {
-					result += " JOIN [\(t2.name)] ON \(t2.conditions.joined(separator: " AND "))"
-				}
+				result += " JOIN \(t2.fromClause) ON \(t2.conditions.joined(separator: " AND "))"
 			}
 
 			if !t1.conditions.isEmpty {
@@ -43,35 +48,81 @@ fileprivate struct SQLSelect {
 	}
 }
 
+/// Lowers a term to a SQL expression. Constants render directly; each `variable` is resolved by the
+/// caller's `leaf` closure (to a bound column, an inverted expression, etc.).
+private func lower(term: Term, leaf: (Var) throws -> SQLExpression) rethrows -> SQLExpression {
+	switch term {
+	case .boolean(let b): return b ? "true" : "false"
+	case .number(let n): return String(n)
+	case .string(let s): return "'\(s)'"
+	case .variable(let v): return try leaf(v)
+	case .expression(let expr):
+		switch expr.raw {
+		case .add(let lhs, let rhs):
+			return "(\(try lower(term: lhs, leaf: leaf)) + \(try lower(term: rhs, leaf: leaf)))"
+		case .multiply(let lhs, let rhs):
+			return "(\(try lower(term: lhs, leaf: leaf)) * \(try lower(term: rhs, leaf: leaf)))"
+		case .exponent(let lhs, let rhs):
+			return "pow(\(try lower(term: lhs, leaf: leaf)), \(try lower(term: rhs, leaf: leaf)))"
+		}
+	}
+}
+
 fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 	let getColumnNames: (_ predicateName: String) throws -> [String]
+	/// Optionally supplies a FROM-clause source for a body predicate (e.g. an inlined `(SELECT …)`
+	/// subquery). Returning `nil` references the predicate by name.
+	let tableSource: (_ predicateName: String) throws -> SQLExpression?
 
-	struct SQLVarRef {
-		var srcTableName: String
-		var srcColumnName: String
+	/// Renders `term` to SQL, resolving each variable through `cols` (variable → SQL expression).
+	/// Throws if a variable has no binding — that means the rule couldn't be lowered.
+	func termToSQL(_ term: Term, _ cols: [Var: SQLExpression]) throws -> SQLExpression {
+		try lower(term: term) { v in
+			guard let sql = cols[v] else {
+				throw SQLiteError.queryError("variable \(v) is not bound by any body literal")
+			}
+			return sql
+		}
 	}
 
-	func termToSQL(_ term: Term, _ cols: [Var: SQLVarRef]) -> SQLExpression {
-		switch term {
-		case .boolean(let b): return b ? "true" : "false"
-		case .number(let n): return String(n)
-		case .string(let s): return "'\(s)'"
-		case .variable(let v):
-			guard let col = cols[v] else {
-				preconditionFailure("Variable \(v) not found in column mapping")
+	/// Solves `expr = target` for the single unbound variable `v`, returning the SQL that computes
+	/// `v` from the (already-bound) column. Only linear, single-occurrence uses of `v` are
+	/// invertible — e.g. `v - 1` → `target + 1`, `v * 2` → `target / 2.0`. Any other shape (or `v`
+	/// appearing on both sides) returns `nil`, leaving the caller to report the rule as unbindable.
+	func invert(
+		_ expr: Term, equalTo target: SQLExpression, for v: Var, _ cols: [Var: SQLExpression]
+	)
+		throws -> SQLExpression?
+	{
+		switch expr {
+		case .variable(let u):
+			return u == v ? target : nil
+		case .expression(let e):
+			// Exactly one operand may contain `v`; the other is treated as a known and moved across.
+			func across(
+				_ withV: Term, _ known: Term, _ solved: (SQLExpression) -> SQLExpression
+			)
+				throws -> SQLExpression?
+			{
+				guard withV.freeVariables.contains(v), !known.freeVariables.contains(v) else {
+					return nil
+				}
+				return try invert(withV, equalTo: try solved(termToSQL(known, cols)), for: v, cols)
 			}
-			return "[\(col.srcTableName)].\(col.srcColumnName)"
-		case .expression(let expr):
-			switch expr {
-			case .add(let lhs, let rhs):
-				return "(\(termToSQL(lhs, cols)) + \(termToSQL(rhs, cols)))"
-			case .subtract(let lhs, let rhs):
-				return "(\(termToSQL(lhs, cols)) - \(termToSQL(rhs, cols)))"
-			case .multiply(let lhs, let rhs):
-				return "(\(termToSQL(lhs, cols)) * \(termToSQL(rhs, cols)))"
-			case .divide(let lhs, let rhs):
-				return "(\(termToSQL(lhs, cols)) / \(termToSQL(rhs, cols)))"
+			var solved: (SQLExpression) -> SQLExpression
+			switch e.raw {
+			case .add(let l, let r):
+				solved = { "(\(target) - \($0))" }
+				return try across(l, r, solved) ?? across(r, l, solved)
+			case .multiply(let l, let r):
+				solved = { "(\(target) / \($0))" }
+				return try across(l, r, solved) ?? across(r, l, solved)
+			case .exponent:
+				// Roots are lossy/multivalued over the reals, so we don't invert exponentiation.
+				return nil
 			}
+		default:
+			return nil
 		}
 	}
 
@@ -80,7 +131,7 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 		var sql = prev
 		switch formula {
 		case .hornClause(positive: let positive, negative: let negatives):
-			var cols: [Var: SQLVarRef] = [:]
+			var cols: [Var: SQLExpression] = [:]
 			var tableNameCounts: [String: Int] = [:]
 
 			// Process each predicate in the body
@@ -90,32 +141,41 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 				tableNameCounts[predicate.name] = count + 1
 
 				let alias = count > 0 ? "\(predicate.name)\(count)" : nil
-				let table = SQLTable(name: predicate.name, alias: alias)
+				var table = SQLTable(name: predicate.name, alias: alias)
+				table.source = try tableSource(predicate.name)
 				sql.fromTables.append(table)
 
 				let columnNames = try getColumnNames(predicate.name)
 
 				for (i, term) in predicate.arguments.enumerated() {
+					let column = "[\(table.effectiveName)].\(columnNames[i])"
 					switch term {
 					case .variable(let v):
-						// If this variable was seen before, create a join condition
-						if let existingRef = cols[v] {
-							// This variable appears in multiple tables - create join condition
-							let condition =
-								"[\(existingRef.srcTableName)].\(existingRef.srcColumnName) = [\(table.effectiveName)].\(columnNames[i])"
-							sql.fromTables[index].conditions.append(condition)
+						// If this variable was seen before, create a join condition; otherwise bind it.
+						if let existing = cols[v] {
+							sql.fromTables[index].conditions.append("\(existing) = \(column)")
 						} else {
-							// First occurrence of this variable
-							cols[v] = SQLVarRef(
-								srcTableName: table.effectiveName,
-								srcColumnName: columnNames[i]
-							)
+							cols[v] = column
 						}
-					case .boolean, .number, .string, .expression:
-						// Add to the WHERE clause
-						let sqlExpr = termToSQL(term, cols)
-						let condition = "[\(table.effectiveName)].\(columnNames[i]) = \(sqlExpr)"
-						sql.fromTables[index].conditions.append(condition)
+					case .boolean, .number, .string:
+						sql.fromTables[index].conditions.append(
+							"\(column) = \(try termToSQL(term, cols))")
+					case .expression:
+						// If every variable is already bound, this is a constraint. If exactly one is
+						//  unbound, try to bind it by inverting the expression against the column (this
+						//  is what lets the recursion variable live in the body, e.g. `nat(N) :- nat(N - 1)`).
+						let unbound = term.freeVariables.filter { cols[$0] == nil }
+						if unbound.isEmpty {
+							sql.fromTables[index].conditions.append(
+								"\(column) = \(try termToSQL(term, cols))")
+						} else if unbound.count == 1, let v = unbound.first,
+							let bound = try invert(term, equalTo: column, for: v, cols)
+						{
+							cols[v] = bound
+						} else {
+							throw SQLiteError.queryError(
+								"cannot solve body expression \(term) for its unbound variable(s)")
+						}
 					}
 				}
 			}
@@ -123,7 +183,7 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 			// Generate SELECT clause based on the head predicate
 			let columnNames = try getColumnNames(positive.name)
 			for (i, term) in positive.arguments.enumerated() {
-				let value = termToSQL(term, cols)
+				let value = try termToSQL(term, cols)
 				sql.select.append("\(value) AS \(columnNames[i])")
 			}
 		}
@@ -134,31 +194,9 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 fileprivate struct QueryIntoSQLReducer: SymbolReducer {
 	let getColumnNames: (_ predicateName: String) throws -> [String]
 
-	func termToSQL(_ term: Term, _ table: SQLTable, _ columnName: String)
-		-> SQLExpression
-	{
-		switch term {
-		case .boolean(let b): return b ? "true" : "false"
-		case .number(let n): return String(n)
-		case .string(let s): return "'\(s)'"
-		case .variable:
-			return "[\(table.effectiveName)].\(columnName)"
-		case .expression(let expr):
-			switch expr {
-			case .add(let lhs, let rhs):
-				return
-					"(\(termToSQL(lhs, table, columnName)) + \(termToSQL(rhs, table, columnName)))"
-			case .subtract(let lhs, let rhs):
-				return
-					"(\(termToSQL(lhs, table, columnName)) - \(termToSQL(rhs, table, columnName)))"
-			case .multiply(let lhs, let rhs):
-				return
-					"(\(termToSQL(lhs, table, columnName)) * \(termToSQL(rhs, table, columnName)))"
-			case .divide(let lhs, let rhs):
-				return
-					"(\(termToSQL(lhs, table, columnName)) / \(termToSQL(rhs, table, columnName)))"
-			}
-		}
+	func termToSQL(_ term: Term, _ table: SQLTable, _ columnName: String) -> SQLExpression {
+		// In a query, every variable in an argument maps to that argument's single column.
+		lower(term: term) { _ in "[\(table.effectiveName)].\(columnName)" }
 	}
 
 	func reduce(_ prev: SQLSelect, _ formula: Formula) throws -> SQLSelect {
@@ -199,11 +237,17 @@ fileprivate struct QueryIntoSQLReducer: SymbolReducer {
 }
 
 extension Symbol {
-	func ruleIntoSQL(_ getColumnNames: @escaping (_ predicateName: String) throws -> [String])
+	func ruleIntoSQL(
+		_ getColumnNames: @escaping (_ predicateName: String) throws -> [String],
+		tableSource: @escaping (_ predicateName: String) throws -> String? = { _ in nil }
+	)
 		throws
 		-> String
 	{
-		try reduce(.empty, RuleIntoSQLReducer(getColumnNames: getColumnNames)).sql
+		try reduce(
+			.empty,
+			RuleIntoSQLReducer(getColumnNames: getColumnNames, tableSource: tableSource)
+		).sql
 	}
 
 	func queryIntoSQL(_ getColumnNames: @escaping (_ predicateName: String) throws -> [String])

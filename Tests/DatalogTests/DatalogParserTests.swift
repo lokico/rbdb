@@ -198,6 +198,57 @@ func roundTripParsingAndPrinting() throws {
 	}
 }
 
+@Test("Subtraction, division, and exponent lower/parse to canonical expressions")
+func parseArithmeticLowerings() throws {
+	let parser = DatalogParser()
+	let v = Var()
+
+	// `-` lowers to add with a negated operand: X - 1 → add(X, -1)
+	let minus = try parser.parse("d(X - 1)")
+	let minusExpected = Formula.hornClause(
+		positive: Predicate(name: "d", arguments: [Term.difference(.variable(v), .number(1))]),
+		negative: [])
+	#expect(minus.canonicalize() == minusExpected.canonicalize())
+
+	// `/` lowers to multiplication by an inverse: X / 2 → X * 0.5
+	let divide = try parser.parse("d(X / 2)")
+	let divideExpected = Formula.hornClause(
+		positive: Predicate(name: "d", arguments: [Term.quotient(.variable(v), .number(2))]),
+		negative: [])
+	#expect(divide.canonicalize() == divideExpected.canonicalize())
+
+	// `^` parses to a power (right-associative).
+	let power = try parser.parse("d(X ^ 2)")
+	let powerExpected = Formula.hornClause(
+		positive: Predicate(name: "d", arguments: [Term.power(.variable(v), .number(2))]),
+		negative: [])
+	#expect(power.canonicalize() == powerExpected.canonicalize())
+
+	// Mixed operators at one precedence level parse correctly: X - 1 + 3 → X + 2
+	let mixed = try parser.parse("d(X - 1 + 3)")
+	let mixedExpected = Formula.hornClause(
+		positive: Predicate(name: "d", arguments: [Term.sum(.variable(v), .number(2))]),
+		negative: [])
+	#expect(mixed.canonicalize() == mixedExpected.canonicalize())
+}
+
+@Test("Arithmetic expressions round-trip through printing")
+func arithmeticRoundTrip() throws {
+	let parser = DatalogParser()
+	for source in [
+		"d(X - 1) :- b(X)",
+		"d(X / 2) :- b(X)",
+		"d(X ^ 2) :- b(X)",
+		"d(2 ^ X ^ 3) :- b(X)",
+		"d(X * Y + 1) :- b(X, Y)",
+	] {
+		let parsed = try parser.parse(source)
+		let printed = try parser.print(parsed)
+		let reparsed = try parser.parse(printed)
+		#expect(parsed == reparsed, "round-trip failed for \(source) (printed: \(printed))")
+	}
+}
+
 @Test("Parse facts with single-quoted strings")
 func parseFactsWithSingleQuotedStrings() throws {
 	let parser = DatalogParser()

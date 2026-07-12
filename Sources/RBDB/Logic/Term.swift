@@ -1,25 +1,9 @@
-public enum Expression: Codable, Comparable {
-	case add(Term, Term)
-	case subtract(Term, Term)
-	case multiply(Term, Term)
-	case divide(Term, Term)
-
-	public var op: String {
-		switch self {
-		case .add: "+"
-		case .subtract: "-"
-		case .multiply: "*"
-		case .divide: "/"
-		}
-	}
-}
-
-public enum Term: Symbol {
+public enum Term: Symbol, CustomDebugStringConvertible {
 	case variable(Var)
 
 	// constants
 	case boolean(Bool)
-	case number(Float)
+	case number(Double)
 	case string(String)
 
 	// expressions
@@ -30,6 +14,16 @@ public enum Term: Symbol {
 		case .variable: .variable
 		case .boolean, .number, .string: .constant
 		case .expression: .expression
+		}
+	}
+
+	public var debugDescription: String {
+		switch self {
+		case .variable(let v): v.description
+		case .boolean(let v): v ? "true" : "false"
+		case .number(let v): String(v)
+		case .string(let v): "\"\(v)\""
+		case .expression(let expr): "(\(expr.debugDescription))"
 		}
 	}
 
@@ -56,15 +50,13 @@ extension SymbolRewriter {
 	}
 	public func rewrite(variable: Var) -> Var { variable }
 	public func rewrite(expression: Expression) -> Expression {
-		switch expression {
+		switch expression.raw {
 		case .add(let lhs, let rhs):
-			.add(rewrite(term: lhs), rewrite(term: rhs))
-		case .subtract(let lhs, let rhs):
-			.subtract(rewrite(term: lhs), rewrite(term: rhs))
+			Expression(.add(rewrite(term: lhs), rewrite(term: rhs)))
 		case .multiply(let lhs, let rhs):
-			.multiply(rewrite(term: lhs), rewrite(term: rhs))
-		case .divide(let lhs, let rhs):
-			.divide(rewrite(term: lhs), rewrite(term: rhs))
+			Expression(.multiply(rewrite(term: lhs), rewrite(term: rhs)))
+		case .exponent(let lhs, let rhs):
+			Expression(.exponent(rewrite(term: lhs), rewrite(term: rhs)))
 		}
 	}
 }
@@ -76,9 +68,8 @@ extension Term {
 		case .variable(let v): [v]
 		case .boolean, .number, .string: []
 		case .expression(let expr):
-			switch expr {
-			case .add(let l, let r), .subtract(let l, let r),
-				.multiply(let l, let r), .divide(let l, let r):
+			switch expr.raw {
+			case .add(let l, let r), .multiply(let l, let r), .exponent(let l, let r):
 				l.freeVariables.union(r.freeVariables)
 			}
 		}
@@ -86,18 +77,42 @@ extension Term {
 
 	/// Returns +1 if this term is monotonically non-decreasing in `variable`,
 	/// -1 if non-increasing, 0 if non-monotonic / unknown / independent.
-	/// Only handles `+ const` and `- const` with simple constants.
+	/// Handles addition and multiplication by a numeric constant (e.g. `X + 1`, `X * 2`, `-X`).
 	public func monotonicity(in variable: Var) -> Int {
 		switch self {
 		case .variable(let v): v == variable ? 1 : 0
 		case .boolean, .number, .string: 0
 		case .expression(let expr):
-			switch expr {
+			switch expr.raw {
 			case .add(let l, let r):
 				combineMonotonicity(l.monotonicity(in: variable), r.monotonicity(in: variable))
-			case .subtract(let l, let r):
-				combineMonotonicity(l.monotonicity(in: variable), -r.monotonicity(in: variable))
-			case .multiply, .divide: 0
+			case .multiply(let l, let r):
+				// Scaling by a numeric constant preserves (positive) or flips (negative) monotonicity.
+				if case .number(let n) = r {
+					l.monotonicity(in: variable) * (n > 0 ? 1 : (n < 0 ? -1 : 0))
+				} else if case .number(let n) = l {
+					r.monotonicity(in: variable) * (n > 0 ? 1 : (n < 0 ? -1 : 0))
+				} else {
+					0
+				}
+			case .exponent: 0
+			}
+		}
+	}
+
+	/// Returns this term with every occurrence of `variable` replaced by `replacement`, rebuilt
+	/// through the normalizing factories so the result is re-canonicalized (constants fold, etc.).
+	/// Substituting a number into a purely-arithmetic term therefore collapses it to a `.number`.
+	public func substituting(_ variable: Var, with replacement: Term) -> Term {
+		switch self {
+		case .variable(let v): return v == variable ? replacement : self
+		case .boolean, .number, .string: return self
+		case .expression(let e):
+			let sub = { (t: Term) in t.substituting(variable, with: replacement) }
+			switch e.raw {
+			case .add(let lhs, let rhs): return .sum(sub(lhs), sub(rhs))
+			case .multiply(let lhs, let rhs): return .product(sub(lhs), sub(rhs))
+			case .exponent(let lhs, let rhs): return .power(sub(lhs), sub(rhs))
 			}
 		}
 	}
@@ -123,11 +138,10 @@ extension SymbolReducer {
 
 	public func reduce(_ prev: Result, _ variable: Var) throws -> Result { prev }
 	public func reduce(_ prev: Result, _ expression: Expression) throws -> Result {
-		switch expression {
+		switch expression.raw {
 		case .add(let lhs, let rhs),
-			.subtract(let lhs, let rhs),
 			.multiply(let lhs, let rhs),
-			.divide(let lhs, let rhs):
+			.exponent(let lhs, let rhs):
 			let result = try reduce(prev, lhs)
 			return try reduce(result, rhs)
 		}
@@ -158,7 +172,7 @@ extension Term: Codable {
 				) {
 					self = .string(stringValue)
 				} else if let floatValue = try? container.decode(
-					Float.self,
+					Double.self,
 					forKey: key
 				) {
 					self = .number(floatValue)

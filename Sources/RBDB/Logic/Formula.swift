@@ -65,13 +65,7 @@ extension Formula: Codable {
 
 		switch key {
 		case .hornClause(let positiveName):
-			var args: [Term] = []
-			var positiveArgs = try arr.nestedUnkeyedContainer()
-			while !positiveArgs.isAtEnd {
-				args.append(try positiveArgs.decode(Term.self))
-			}
-			let positive = Predicate(name: positiveName, arguments: args)
-
+			let positive = Predicate(name: positiveName, arguments: try arr.decode([Term].self))
 			var negatives: [Predicate] = []
 			while !arr.isAtEnd {
 				negatives.append(try arr.decode(Predicate.self))
@@ -92,10 +86,7 @@ extension Formula: Codable {
 		try arr.encode(type)
 		switch self {
 		case .hornClause(positive: let positive, negative: let negatives):
-			var positiveArr = arr.nestedUnkeyedContainer()
-			for arg in positive.arguments {
-				try positiveArr.encode(arg)
-			}
+			try arr.encode(positive.arguments)
 			for negative in negatives {
 				try arr.encode(negative)
 			}

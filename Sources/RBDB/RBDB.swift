@@ -202,33 +202,30 @@ public class RBDB: SQLiteDatabase {
 		)
 	}
 
-	private func createViewAndTrigger<T: StringProtocol>(
-		for tableName: T, columns: [String], rules: [Formula]
-	)
+	/// The `SELECT` over `_rule` that yields a predicate's base facts — rows asserted with no body.
+	/// Each column is aliased to its predicate column name. `arg1`/`arg2` are indexed columns; any
+	/// further columns are read out of the JSON `formula`. Since facts have no body variables, the
+	/// arguments are always constants and are selected directly.
+	func baseFactsSelect(for name: String, columns: [String]) -> String {
+		let selectList = columns.enumerated().map { idx, column -> String in
+			let i = idx + 1
+			let value = i <= 2 ? "arg\(i)_constant" : "json_extract(formula, '$[1][\(i - 1)].\"\"')"
+			return "\(value) AS [\(column)]"
+		}
+		return """
+			SELECT \(selectList.joined(separator: ", "))
+			FROM _rule
+			WHERE output_type = '@\(name)'
+			  AND negative_literal_count = 0
+			"""
+	}
+
+	private func createViewAndTrigger(for tableName: String, columns: [String], rules: [Formula])
 		throws
 	{
 		let columnList = columns.map { "[\($0)]" }.joined(separator: ", ")
 
-		// If there are no negative literals in a horn clause, it's a fact, and since we don't
-		//  allow variables that only appear in the head and not the body, we shouldn't hit
-		//  any variables in this case.. just assume the values are constants and select them.
-		var selectList: [String] = []
-		selectList.reserveCapacity(columns.count)
-		for i in 1...columns.count {
-			switch i {
-			case 1...2: selectList.append("arg\(i)_constant")  // these are indexed
-			default: selectList.append("json_extract(formula, '$[1][\(i-1)].\"\"')")  // not indexed
-			}
-		}
-
-		var selects = [
-			"""
-			SELECT \(selectList.joined(separator: ", "))
-			FROM _rule
-			WHERE output_type = '@\(tableName)'
-			  AND negative_literal_count = 0
-			"""
-		]
+		var selects = [baseFactsSelect(for: tableName, columns: columns)]
 
 		for rule in rules {
 			var columnsQuery: SQLiteCursor? = nil
@@ -272,12 +269,12 @@ public class RBDB: SQLiteDatabase {
 	}
 
 	// Returns nil on unknown predicate
-	private func getColumns<T: StringProtocol>(for predicate: T) throws -> [String]? {
+	func getColumns<T: StringProtocol>(for predicate: T) throws -> [String]? {
 		var cursor: SQLiteCursor? = nil
 		return try getColumns(for: predicate, query: &cursor)
 	}
 
-	private func getColumns<T: StringProtocol>(for predicate: T, query: inout SQLiteCursor?) throws
+	func getColumns<T: StringProtocol>(for predicate: T, query: inout SQLiteCursor?) throws
 		-> [String]?
 	{
 		var cursor: SQLiteCursor
@@ -321,31 +318,34 @@ public class RBDB: SQLiteDatabase {
 		else {
 			return nil
 		}
-		let predicateName = match.1
-		let rules = try fetchRules(for: predicateName)
+		let predicateName = String(match.1)
 
 		let retrySQL: SQL
-		if rules.contains(where: { $0.isRecursive(for: predicateName) }) {
-			// Ideally, we could just use a `WITH RECURSIVE` CTE in our view in `createViewAndTrigger`,
-			// but SQLite won't push down WHERE clause conditions into the recursive part of the CTE,
-			// which means the recursion wouldn't terminate. Instead, we build a custom CTE on the fly
-			// that includes the specific bounds derived from the query's WHERE clause.
+		if try involvesRecursion(predicateName) {
+			// A predicate that (transitively) involves recursion can't be a plain view: it only ever
+			//  exists as a query-time CTE, and a view body can't reference a CTE. So we materialize the
+			//  whole recursive closure — the predicate plus every recursive predicate it depends on —
+			//  as CTEs in one `WITH RECURSIVE` statement prepended to the failing query.
+			//
+			// We can't push the bounds via a plain view either: SQLite won't push the query's WHERE
+			//  down into the recursive arm of a CTE, so the recursion wouldn't terminate. Instead we
+			//  derive the bounds ourselves and inject them into each recursive step.
 			// See https://github.com/sqlite/sqlite/blob/6176034151d10b29a38b0e67f27818a719c68139/src/select.c#L5054
-			retrySQL = try inlineBoundedCTE(
-				predicateName: String(predicateName),
-				columnNames: columnNames,
-				rules: rules,
+			retrySQL = try buildRecursiveClosureCTE(
+				topPredicate: predicateName,
+				topColumns: columnNames,
 				sql: sql,
 				startIndex: startIndex
 			)
 		} else {
+			let rules = try fetchRules(for: predicateName)
 			try createViewAndTrigger(for: predicateName, columns: columnNames, rules: rules)
 			retrySQL = sql.at(startIndex: startIndex)
 		}
 		return try query(sql: retrySQL)
 	}
 
-	private func fetchRules<S: StringProtocol>(for predicateName: S) throws -> [Formula] {
+	func fetchRules(for predicateName: String) throws -> [Formula] {
 		let cursor = try super.query(
 			sql: """
 				SELECT json(formula) as json
@@ -365,262 +365,5 @@ public class RBDB: SQLiteDatabase {
 			rules.append(try decoder.decode(Formula.self, from: data))
 		}
 		return rules
-	}
-
-	/// Builds a SQL with a `WITH RECURSIVE [predicateName](cols) AS (...)` clause prepended to
-	/// the failing statement (starting at `startIndex` in the original SQL). The CTE shadows the
-	/// view that would otherwise be created. For each recursive rule whose head expression is a
-	/// known monotonic function of a body variable bound to a constrained column in the user's
-	/// WHERE clause, we wrap the rule SQL in a subquery and add the corresponding upper/lower
-	/// bound — that is what makes the recursion terminate.
-	private func inlineBoundedCTE(
-		predicateName: String,
-		columnNames: [String],
-		rules: [Formula],
-		sql: SQL,
-		startIndex: SQL.Index
-	) throws -> SQL {
-		let stmt = String(sql.queryText.utf8.dropFirst(startIndex.queryOffset))!
-		let constraints = extractEqualityConstraints(
-			from: stmt, predicateName: predicateName, columnNames: columnNames)
-
-		let columnList = columnNames.map { "[\($0)]" }.joined(separator: ", ")
-
-		// Base case: facts (formulas with no negative literals for this predicate).
-		var factSelectList: [String] = []
-		factSelectList.reserveCapacity(columnNames.count)
-		for i in 1...columnNames.count {
-			switch i {
-			case 1...2: factSelectList.append("arg\(i)_constant")
-			default: factSelectList.append("json_extract(formula, '$[1][\(i-1)].\"\"')")
-			}
-		}
-		var selects = [
-			"""
-			SELECT \(factSelectList.joined(separator: ", "))
-			FROM _rule
-			WHERE output_type = '@\(predicateName)'
-			  AND negative_literal_count = 0
-			"""
-		]
-
-		var columnsQuery: SQLiteCursor? = nil
-		let getCols: (String) throws -> [String] = { name in
-			guard let cols = try self.getColumns(for: name, query: &columnsQuery) else {
-				throw RBDBError.corruptData(
-					message: "rule for '\(predicateName)' references unknown predicate '\(name)'")
-			}
-			return cols
-		}
-
-		for rule in rules {
-			let ruleSQL = try rule.ruleIntoSQL(getCols)
-			var finalSQL = ruleSQL
-			if rule.isRecursive(for: predicateName),
-				let bounds = boundsForRecursiveStep(
-					rule: rule,
-					predicateName: predicateName,
-					columnNames: columnNames,
-					constraints: constraints)
-			{
-				// SQLite forbids referencing a recursive CTE from inside a subquery, so we can't
-				//  wrap the rule SQL — inject the bound conditions directly. The rule SQL never
-				//  contains a WHERE today (RuleIntoSQLReducer only puts conditions on JOIN ON
-				//  clauses), but be defensive in case that changes.
-				let connector =
-					ruleSQL.range(of: " WHERE ", options: .caseInsensitive) != nil
-					? " AND " : " WHERE "
-				finalSQL = ruleSQL + connector + bounds.joined(separator: " AND ")
-			}
-			selects.append(finalSQL)
-		}
-
-		let cte = """
-			WITH RECURSIVE [\(predicateName)] (\(columnList)) AS (
-			\(selects.joined(separator: "\nUNION\n"))
-			)
-			"""
-		return SQL(
-			"\(cte)\n\(stmt)", arguments: Array(sql.arguments.dropFirst(startIndex.argumentIndex)))
-	}
-
-	/// Returns SQL bounds (e.g. `[n] <= 100`) to add to a recursive rule's step, derived from the
-	/// query's equality constraints and the head expression's monotonicity in the body variables.
-	/// Returns nil if no usable bound was found — the caller will leave the rule unconstrained.
-	private func boundsForRecursiveStep(
-		rule: Formula,
-		predicateName: String,
-		columnNames: [String],
-		constraints: [String: String]
-	) -> [String]? {
-		guard !constraints.isEmpty,
-			case .hornClause(let head, let bodies) = rule
-		else { return nil }
-
-		let recursiveVars: Set<Var> =
-			bodies
-			.filter { $0.name == predicateName }
-			.flatMap(\.arguments)
-			.compactMap { if case .variable(let v) = $0 { v } else { nil } }
-			.reduce(into: []) { $0.insert($1) }
-
-		var bounds: [String] = []
-		for (colIdx, headTerm) in head.arguments.enumerated()
-		where colIdx < columnNames.count {
-			let colName = columnNames[colIdx]
-			guard let bound = constraints[colName] else { continue }
-			let usedVars = headTerm.freeVariables
-			guard !usedVars.isEmpty, usedVars.allSatisfy({ recursiveVars.contains($0) }) else {
-				continue
-			}
-			var common = 0
-			var ok = true
-			for v in usedVars {
-				let m = headTerm.monotonicity(in: v)
-				if m == 0 {
-					ok = false
-					break
-				}
-				if common == 0 {
-					common = m
-				} else if common != m {
-					ok = false
-					break
-				}
-			}
-			if ok {
-				bounds.append("[\(colName)] \(common > 0 ? "<=" : ">=") \(bound)")
-			}
-		}
-		return bounds.isEmpty ? nil : bounds
-	}
-
-	/// Best-effort extraction of `[predicate].column = literal` style equality constraints from
-	/// the failing statement text. Handles the form generated by `queryIntoSQL` and common
-	/// hand-written variants. Returns map of column name → literal SQL expression.
-	private func extractEqualityConstraints(
-		from stmt: String, predicateName: String, columnNames: [String]
-	) -> [String: String] {
-		var result: [String: String] = [:]
-		let escName = NSRegularExpression.escapedPattern(for: predicateName)
-		for col in columnNames {
-			let escCol = NSRegularExpression.escapedPattern(for: col)
-			let pattern =
-				"\\[?\\s*\(escName)\\s*\\]?\\s*\\.\\s*\\[?\\s*\(escCol)\\s*\\]?\\s*=\\s*(-?\\d+(?:\\.\\d+)?|'[^']*'|true|false)"
-			guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
-				let match = regex.firstMatch(
-					in: stmt, range: NSRange(stmt.startIndex..., in: stmt)),
-				let valueRange = Range(match.range(at: 1), in: stmt)
-			else { continue }
-			result[col] = String(stmt[valueRange])
-		}
-		return result
-	}
-}
-
-func formulaToJSON(_ formula: Formula) throws -> String {
-	let encoder = JSONEncoder()
-	let canonicalFormula = formula.canonicalize()
-	guard
-		let jsonStr = String(
-			data: try encoder.encode(canonicalFormula),
-			encoding: .utf8
-		)
-	else {
-		throw RBDBError.corruptData(
-			message: "Failed to encode formula as UTF-8 JSON"
-		)
-	}
-	return jsonStr
-}
-
-// SQLite function implementation for predicate_formula()
-func predicateFormulaSQLiteFunction(
-	context: OpaquePointer?,
-	argc: Int32,
-	argv: UnsafeMutablePointer<OpaquePointer?>?
-) {
-	guard argc >= 1, let argv = argv else {
-		sqlite3_result_error(
-			context,
-			"predicate_formula() requires at least one argument",
-			-1
-		)
-		return
-	}
-
-	// Get the predicate name (first argument)
-	guard let predicateNamePtr = sqlite3_value_text(argv[0]) else {
-		sqlite3_result_error(
-			context,
-			"predicate_formula() first argument must be a string",
-			-1
-		)
-		return
-	}
-	let predicateName = String(cString: predicateNamePtr)
-
-	// Convert remaining arguments to Terms
-	var terms: [Term] = []
-	for i in 1..<argc {
-		let value = argv[Int(i)]
-		let sqliteType = sqlite3_value_type(value)
-
-		let term: Term
-		switch sqliteType {
-		case SQLITE_TEXT:
-			let textPtr = sqlite3_value_text(value)
-			let text = String(cString: textPtr!)
-			term = .string(text)
-		case SQLITE_INTEGER:
-			let intValue = sqlite3_value_int64(value)
-			term = .number(Float(intValue))
-		case SQLITE_FLOAT:
-			let floatValue = sqlite3_value_double(value)
-			term = .number(Float(floatValue))
-		case SQLITE_NULL:
-			sqlite3_result_error(
-				context,
-				"predicate_formula() does not support NULL arguments",
-				-1
-			)
-			return
-		case SQLITE_BLOB:
-			sqlite3_result_error(
-				context,
-				"predicate_formula() does not support BLOB arguments",
-				-1
-			)
-			return
-		default:
-			sqlite3_result_error(
-				context,
-				"predicate_formula() unsupported argument type",
-				-1
-			)
-			return
-		}
-
-		terms.append(term)
-	}
-
-	// Create the Formula
-	let formula = Formula.predicate(Predicate(name: predicateName, arguments: terms))
-
-	// Convert to JSON using the utility function
-	do {
-		let jsonStr = try formulaToJSON(formula)
-
-		// Return the JSON string
-		jsonStr.withCString { cString in
-			sqlite3_result_text(
-				context,
-				cString,
-				-1,
-				unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-			)
-		}
-	} catch {
-		sqlite3_result_error(context, "Failed to encode formula: \(error)", -1)
 	}
 }

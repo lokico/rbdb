@@ -22,7 +22,7 @@ import Testing
 	try assertJSON(Term.number(5.7), expect: "{\"\":5.7}")
 	try assertJSON(Term.number(-5.123), expect: "{\"\":-5.123}")
 	#expect(throws: EncodingError.self) {
-		try assertJSON(Term.number(Float.nan), expect: "")
+		try assertJSON(Term.number(Double.nan), expect: "")
 	}
 }
 

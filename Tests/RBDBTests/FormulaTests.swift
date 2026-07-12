@@ -116,3 +116,36 @@ import Testing
 		canonical1 == canonical3,
 		"Horn clauses with different negative order should canonicalize equally")
 }
+
+@Test func commutativeVariableOperandsAlphaEquivalent() throws {
+	// The head `r(Y, X + Y)` renames Y→A, X→B, which reorders the sorted `X + Y` expression by
+	//  id — the rewriter must re-normalize after renaming so alpha-variants encode identically.
+	func makeRule(_ first: Var, _ second: Var) -> Formula {
+		.hornClause(
+			positive: Predicate(
+				name: "r",
+				arguments: [.variable(first), Term.sum(.variable(second), .variable(first))]),
+			negative: [
+				Predicate(name: "a", arguments: [.variable(second)]),
+				Predicate(name: "b", arguments: [.variable(first)]),
+			])
+	}
+
+	let rule1 = makeRule(Var("Y"), Var("X"))
+	let rule2 = makeRule(Var("Q"), Var("P"))
+
+	let encoder = JSONEncoder()
+	let json1 = String(data: try encoder.encode(rule1.canonicalize()), encoding: .utf8)!
+	let json2 = String(data: try encoder.encode(rule2.canonicalize()), encoding: .utf8)!
+	#expect(json1 == json2)
+}
+
+@Test func canonicalizeNormalizesRawNonCanonicalExpression() throws {
+	// A raw (package-constructed) non-canonical expression must be normalized by canonicalize().
+	let rawFolds = Term.expression(Expression(.add(.number(1), .number(2))))
+	let formula = Formula.hornClause(
+		positive: Predicate(name: "p", arguments: [rawFolds]), negative: [])
+	let expected = Formula.hornClause(
+		positive: Predicate(name: "p", arguments: [.number(3)]), negative: [])
+	#expect(formula.canonicalize() == expected.canonicalize())
+}
