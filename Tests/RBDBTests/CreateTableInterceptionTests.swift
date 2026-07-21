@@ -6,24 +6,38 @@ import Testing
 @Suite("CREATE TABLE Interception Tests")
 struct CreateTableInterceptionTests {
 
-	@Test("Simple CREATE TABLE is intercepted and recorded in predicate table")
-	func simpleCreateTableInterception() async throws {
+	@Test(
+		"Simple CREATE TABLE is intercepted and recorded in predicate table",
+		arguments: [nil, "This is a comment!"])
+	func simpleCreateTableInterception(comment: String?) async throws {
 		let rbdb = try RBDB(path: ":memory:")
 
+		var sql: String
+		if let comment = comment {
+			sql =
+				"CREATE TABLE users (\n --! \(comment)\n id INTEGER, /* c-style\n multi-line */ name TEXT, email TEXT)"
+		} else {
+			sql = "CREATE TABLE users (id INTEGER, -- ignored\n name TEXT, email TEXT)"
+		}
+
 		// Execute a CREATE TABLE statement
-		try rbdb.query(sql: "CREATE TABLE users (id INTEGER, name TEXT, email TEXT)")
+		try rbdb.query(sql: SQL(sql))
 
 		// Check that the predicate was recorded
 		let results = Array(
 			try rbdb.query(
 				sql:
-					"SELECT name, json(column_names) as column_names_json FROM _predicate WHERE name = 'users'"
+					"SELECT name, descr, json(column_names) as column_names_json FROM _predicate WHERE name = 'users'"
 			))
 
 		#expect(results.count == 1, "Should have one predicate record")
 		#expect(
 			results[0]["name"] as? String == "users",
 			"Table name should be recorded"
+		)
+		#expect(
+			results[0]["descr"] as? String == comment,
+			"Table comment should be recorded"
 		)
 
 		if let columnNamesJson = results[0]["column_names_json"] as? String,
@@ -91,8 +105,7 @@ struct CreateTableInterceptionTests {
 				        name VARCHAR(255) NOT NULL,
 				        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 				        price DECIMAL(10,2),
-				        data BLOB,
-				        UNIQUE(name)
+				        data BLOB
 				    )
 				"""
 		)
@@ -291,6 +304,229 @@ struct CreateTableInterceptionTests {
 		// Try to create the same table again without IF NOT EXISTS - should throw
 		#expect(throws: SQLiteError.self) {
 			try rbdb.query(sql: "CREATE TABLE test_table (id INTEGER, name TEXT)")
+		}
+	}
+
+	@Test("CREATE TABLE with WITHOUT ROWID / STRICT table options")
+	func createTableWithTableOptions() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(
+			sql: "CREATE TABLE options_table (id INTEGER PRIMARY KEY, name TEXT) STRICT"
+		)
+
+		let results = Array(
+			try rbdb.query(
+				sql:
+					"SELECT name, json(column_names) as column_names_json FROM _predicate WHERE name = 'options_table'"
+			))
+
+		#expect(results.count == 1, "Should have one predicate record")
+
+		if let columnNamesJson = results[0]["column_names_json"] as? String,
+			let columnNamesData = columnNamesJson.data(using: .utf8)
+		{
+			let columnNames =
+				try JSONSerialization.jsonObject(with: columnNamesData)
+				as? [String]
+			#expect(
+				columnNames == ["id", "name"],
+				"Column names should be parsed correctly, ignoring trailing table options"
+			)
+		} else {
+			#expect(Bool(false), "column_names should be accessible as JSON")
+		}
+	}
+
+	@Test(
+		"CREATE TABLE with a table-level constraint throws since constraints aren't enforced",
+		arguments: [
+			"UNIQUE(name)",
+			"UNIQUE (name)",
+			"FOREIGN KEY (customer_id) REFERENCES customers(id)",
+			"CHECK(quantity > 0)",
+			"CHECK (quantity > 0)",
+			"PRIMARY KEY (id, customer_id)",
+			"CONSTRAINT pk PRIMARY KEY (id)",
+		])
+	func createTableWithTableConstraintThrows(constraint: String) async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		#expect(throws: SQLiteError.self) {
+			try rbdb.query(
+				sql: """
+					CREATE TABLE orders (
+					    id INTEGER,
+					    customer_id INTEGER,
+					    quantity INTEGER,
+					    name TEXT,
+					    \(constraint)
+					)
+					"""
+			)
+		}
+	}
+
+	@Test("CREATE TABLE with multi-line table comment")
+	func createTableWithMultiLineComment() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(
+			sql: """
+				CREATE TABLE commented_table (
+				 --! First line of comment
+				 --! Second line of comment
+				 id INTEGER, name TEXT)
+				"""
+		)
+
+		let results = Array(
+			try rbdb.query(
+				sql: "SELECT descr FROM _predicate WHERE name = 'commented_table'"
+			))
+
+		#expect(results.count == 1, "Should have one predicate record")
+		#expect(
+			results[0]["descr"] as? String == "First line of comment\nSecond line of comment",
+			"Multi-line comment should be joined with newlines"
+		)
+	}
+
+	@Test("CREATE TEMP TABLE is not intercepted")
+	func createTempTableIsNotIntercepted() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		// CREATE TEMP TABLE doesn't match the "CREATE TABLE" prefix check, so it should
+		//  fall through to normal SQLite execution rather than being recorded as a predicate.
+		try rbdb.query(sql: "CREATE TEMP TABLE scratch (id INTEGER, name TEXT)")
+
+		let results = Array(
+			try rbdb.query(
+				sql: "SELECT name FROM _predicate WHERE name = 'scratch'"
+			))
+		#expect(
+			results.isEmpty,
+			"CREATE TEMP TABLE should not be recorded in the predicate table"
+		)
+
+		// The table should still be usable directly via SQLite though.
+		try rbdb.query(sql: "INSERT INTO scratch (id, name) VALUES (1, 'a')")
+		let scratchResults = Array(try rbdb.query(sql: "SELECT id, name FROM scratch"))
+		#expect(scratchResults.count == 1)
+	}
+
+	@Test("lowercase \"create table\" is intercepted")
+	func lowercaseCreateTableIsIntercepted() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(sql: "create table scratch (id INTEGER, name TEXT)")
+
+		let results = Array(
+			try rbdb.query(
+				sql:
+					"SELECT name, json(column_names) as column_names_json FROM _predicate WHERE name = 'scratch'"
+			))
+		#expect(
+			results.count == 1,
+			"lowercase create table should be recorded in the predicate table"
+		)
+
+		if let columnNamesJson = results[0]["column_names_json"] as? String,
+			let columnNamesData = columnNamesJson.data(using: .utf8)
+		{
+			let columnNames =
+				try JSONSerialization.jsonObject(with: columnNamesData)
+				as? [String]
+			#expect(
+				columnNames == ["id", "name"],
+				"Column names should be parsed correctly"
+			)
+		} else {
+			#expect(Bool(false), "column_names should be accessible as JSON")
+		}
+	}
+
+	@Test("mixed-case \"Create Table\" is intercepted")
+	func mixedCaseCreateTableIsIntercepted() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(sql: "Create Table scratch (id INTEGER, name TEXT)")
+
+		let results = Array(
+			try rbdb.query(
+				sql: "SELECT name FROM _predicate WHERE name = 'scratch'"
+			))
+		#expect(
+			results.count == 1,
+			"mixed-case create table should be recorded in the predicate table"
+		)
+	}
+
+	@Test("CREATE TABLE AS SELECT throws since it cannot be parsed as a column list")
+	func createTableAsSelectThrows() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(sql: "CREATE TABLE source_table (id INTEGER, name TEXT)")
+
+		#expect(throws: SQLiteError.self) {
+			try rbdb.query(
+				sql: "CREATE TABLE derived_table AS SELECT * FROM source_table"
+			)
+		}
+	}
+
+	@Test("CREATE TABLE with schema-qualified name")
+	func createTableWithSchemaQualifiedName() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(sql: "CREATE TABLE main.qualified_table (id INTEGER, name TEXT)")
+
+		let results = Array(
+			try rbdb.query(
+				sql: "SELECT name FROM _predicate WHERE name = 'main.qualified_table'"
+			))
+
+		#expect(
+			results.count == 1,
+			"Schema-qualified table name should be recorded as-is"
+		)
+	}
+
+	@Test("CREATE TABLE with default values and generated columns")
+	func createTableWithDefaultsAndGeneratedColumns() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		try rbdb.query(
+			sql: """
+				CREATE TABLE items (
+				    id INTEGER PRIMARY KEY,
+				    quantity INTEGER DEFAULT 0,
+				    price REAL DEFAULT (1.0 + 2.0),
+				    total REAL GENERATED ALWAYS AS (quantity * price) STORED
+				)
+				"""
+		)
+
+		let results = Array(
+			try rbdb.query(
+				sql:
+					"SELECT json(column_names) as column_names_json FROM _predicate WHERE name = 'items'"
+			))
+
+		#expect(results.count == 1, "Should have one predicate record")
+
+		if let columnNamesJson = results[0]["column_names_json"] as? String,
+			let columnNamesData = columnNamesJson.data(using: .utf8)
+		{
+			let columnNames =
+				try JSONSerialization.jsonObject(with: columnNamesData)
+				as? [String]
+			#expect(
+				columnNames == ["id", "quantity", "price", "total"],
+				"Column names should be parsed correctly despite parenthesized defaults"
+			)
+		} else {
+			#expect(Bool(false), "column_names should be accessible as JSON")
 		}
 	}
 

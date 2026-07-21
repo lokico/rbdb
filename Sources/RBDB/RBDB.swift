@@ -48,9 +48,12 @@ public class RBDB: SQLiteDatabase {
 		}
 		override func step(statement: SQLiteCursor.PreparedStatement) throws -> Bool {
 			if !rbdb.isInitializing {
-				if let normalizedSQL = sqlite3_normalized_sql(statement.ptr) {
-					let sqlString = String(cString: normalizedSQL)
-					if sqlString.hasPrefix("CREATE TABLE") {
+				if let sqlText = sqlite3_sql(statement.ptr) {
+					let sqlString = String(cString: sqlText).trimmingCharacters(
+						in: .whitespacesAndNewlines)
+					if sqlString.range(
+						of: "CREATE TABLE", options: [.caseInsensitive, .anchored]
+					) != nil {
 						try rbdb.interceptCreateTable(sqlString)
 
 						// Return empty result set instead of letting SQLite execute
@@ -180,9 +183,10 @@ public class RBDB: SQLiteDatabase {
 			// Insert into predicate table using the last inserted entity ID and jsonb function
 			// Use INSERT OR IGNORE if IF NOT EXISTS was specified
 			let orIgnore = SQL(createTable.ifNotExists ? "OR IGNORE " : "")
+			let descr: SQL = createTable.comment.flatMap { "\($0)" } ?? SQL("null")
 			let insertSQL: SQL = """
-					INSERT \(orIgnore)INTO _predicate (internal_entity_id, name, column_names)
-					VALUES (last_insert_rowid(), \(createTable.tableName), jsonb(\(columnNamesJson)))
+					INSERT \(orIgnore)INTO _predicate (internal_entity_id, name, column_names, descr)
+					VALUES (last_insert_rowid(), \(createTable.tableName), jsonb(\(columnNamesJson)), \(descr))
 				"""
 			try super.query(sql: insertSQL)
 

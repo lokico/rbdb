@@ -18,7 +18,8 @@ let package = Package(
 			name: "Datalog",
 			targets: ["Datalog"]),
 		.executable(
-			name: "rbdb",
+			// Suffixed with "1" because Xcode 26.6 gets confused by product names that differ only in case, though the `swift` CLI has no problem with it.
+			name: "rbdb1",
 			targets: ["CLI"]),
 	],
 	dependencies: [

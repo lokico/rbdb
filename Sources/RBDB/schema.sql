@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS _entity (
 CREATE TABLE IF NOT EXISTS _predicate (
     internal_entity_id INTEGER PRIMARY KEY REFERENCES _entity,
     name TEXT UNIQUE NOT NULL,
+    descr TEXT,
     column_names BLOB -- JSONB
 ) STRICT;
 

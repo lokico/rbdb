@@ -17,7 +17,7 @@ dependencies: [
 ```
 ### SQLite Dependency
 
-RBDB requires SQLite 3.45.0 or newer built with `SQLITE_ENABLE_NORMALIZE` and `SQLITE_ENABLE_MATH_FUNCTIONS`. The system SQLite on macOS 26 is known to work. Otherwise, you'll need to build SQLite and supply a module map (see Dockerfile for an example).
+RBDB requires SQLite 3.45.0 or newer built with `SQLITE_ENABLE_MATH_FUNCTIONS` (the default in most builds). The system SQLite on macOS is known to work. Otherwise, you'll need to build SQLite and supply a module map (see Dockerfile for an example).
 
 ## Usage
 
@@ -136,7 +136,7 @@ Note that datalog variables must start with an uppercase letter, but the results
 
 ## Docker & Containerization
 
-The provided Dockerfile creates a complete Swift build environment with RBDB dependencies, including a custom SQLite build with `SQLITE_ENABLE_NORMALIZE`. This can be used as a builder stage for containerized services.
+The provided Dockerfile creates a complete Swift build environment with RBDB dependencies, including a custom SQLite build. This can be used as a builder stage for containerized services.
 
 ### Building RBDB in Docker
 
@@ -183,14 +183,14 @@ CMD ["your-service"]
 This approach:
 - Leverages the RBDB build environment with proper SQLite configuration
 - Produces lightweight production containers with only runtime dependencies
-- Maintains the custom SQLite build required for RBDB's normalized SQL feature
+- Maintains a custom SQLite build that could be easily customized further
 
 ## Development
 
 ### Prerequisites
 
 - Swift 6.0 or later
-- System SQLite from macOS 26, or SQLite built with `SQLITE_ENABLE_NORMALIZE` (see Dockerfile)
+- SQLite 3.45.0 or newer (e.g. system SQLite on macOS)
 
 ### Building from Source
 
