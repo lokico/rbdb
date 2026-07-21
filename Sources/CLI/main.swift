@@ -479,6 +479,7 @@ func main() {
 	let database: RBDB
 	do {
 		database = try RBDB(path: dbPath)
+		try database.registerDatalogFunction()
 	} catch {
 		print("Error opening database: \(error)")
 		exit(1)

@@ -113,6 +113,28 @@ public class SQLiteDatabase {
 	public func query(sql: SQL) throws -> SQLiteCursor {
 		return try SQLiteCursor(self, sql: sql)
 	}
+
+	/// Registers a custom scalar SQL function on this database connection.
+	///
+	/// This lets other modules (which can't see the private `db` handle) add their own
+	/// SQLite functions, the same way `uuidv7()` and `sql_exec()` are registered above.
+	public func registerFunction(
+		name: String,
+		argumentCount: Int32,
+		flags: Int32 = SQLITE_UTF8,
+		_ function:
+			@escaping @convention(c) (
+				OpaquePointer?, Int32, UnsafeMutablePointer<OpaquePointer?>?
+			) -> Void
+	) throws {
+		guard
+			sqlite3_create_function(
+				db, name, argumentCount, flags, nil, function, nil, nil
+			) == SQLITE_OK
+		else {
+			throw SQLiteError.couldNotRegisterFunction(name: name)
+		}
+	}
 }
 
 /// Custom SQLite function to execute SQL statements from within triggers
