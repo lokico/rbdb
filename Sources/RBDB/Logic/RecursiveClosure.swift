@@ -41,10 +41,9 @@ extension RBDB {
 	func buildRecursiveClosureCTE(
 		topPredicate: String,
 		topColumns: [String],
-		sql: SQL,
-		startIndex: SQL.Index
+		sql: SQL
 	) throws -> SQL {
-		var stmt = String(sql.queryText.utf8.dropFirst(startIndex.queryOffset))!
+		var stmt = String(sql.queryText.utf8.dropFirst(sql.startIndex.queryOffset))!
 
 		// Thread the query's constraints down the dependency graph so each self-recursive predicate
 		//  learns the bounds that make its recursion terminate (first path to reach it wins).
@@ -74,7 +73,7 @@ extension RBDB {
 		try thread(topPredicate, topColumns, topConstraints)
 
 		// Build the SQL. `cteDefinitions`/`cteOrder` collect the self-recursive CTEs (emitted
-		//  dependency-first); `inlining` guards against unbounded expansion of mutual recursion.
+		//  dependency-first); `inlining` guards against unbounded expansion of unsupported recursion.
 		var cteDefinitions: [String: String] = [:]
 		var cteOrder: [String] = []
 		var inlining: Set<String> = []
@@ -91,9 +90,13 @@ extension RBDB {
 			guard try involvesRecursion(name), let columns = try getColumns(for: name) else {
 				return nil  // plain view or base table
 			}
+			// A non-self-recursive predicate that (transitively) depends on itself is mutual recursion.
+			//  The finite case is handled by the iterative evaluator; reaching here means a
+			//  value-generating predicate feeds a cycle, which neither engine can express. Reject it
+			//  with a clear error rather than looping forever inlining the cycle.
 			guard inlining.insert(name).inserted else {
 				throw SQLiteError.queryError(
-					"mutual recursion involving '\(name)' is not supported")
+					"value-generating mutual recursion involving '\(name)' is not supported")
 			}
 			defer { inlining.remove(name) }
 			return "(\n\(try predicateBody(name, columns, rules, separator: "\nUNION ALL\n"))\n)"
@@ -157,13 +160,37 @@ extension RBDB {
 			// Dependent top: inline it as a streaming `FROM`-subquery over its recursive closure.
 			let body = try predicateBody(
 				topPredicate, topColumns, topRules, separator: "\nUNION ALL\n")
-			stmt = stmt.replacingOccurrences(
-				of: "FROM [\(topPredicate)]", with: "FROM (\n\(body)\n) AS [\(topPredicate)]")
+			stmt = replaceTableReference(
+				in: stmt, table: topPredicate, with: "(\n\(body)\n) AS [\(topPredicate)]")
 		}
 
 		let cte = "WITH RECURSIVE " + cteOrder.map { cteDefinitions[$0]! }.joined(separator: ",\n")
 		return SQL(
-			"\(cte)\n\(stmt)", arguments: Array(sql.arguments.dropFirst(startIndex.argumentIndex)))
+			"\(cte)\n\(stmt)",
+			arguments: Array(sql.arguments.dropFirst(sql.startIndex.argumentIndex)))
+	}
+
+	/// Replaces every `FROM`/`JOIN` reference to `table` with `replacement`, matching the table name
+	/// whether or not it is `[bracket]`-quoted (queries built by `queryIntoSQL` bracket it; raw SQL
+	/// typed at the CLI does not). A trailing boundary keeps `daughter` from matching `daughters`.
+	private func replaceTableReference(in stmt: String, table: String, with replacement: String)
+		-> String
+	{
+		let escaped = NSRegularExpression.escapedPattern(for: table)
+		let pattern = "\\b(FROM|JOIN)\\s+\\[?\(escaped)\\]?(?![\\w\\[])"
+		guard
+			let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+		else { return stmt }
+
+		var result = stmt
+		let matches = regex.matches(in: result, range: NSRange(result.startIndex..., in: result))
+		for match in matches.reversed() {
+			guard let range = Range(match.range, in: result),
+				let keywordRange = Range(match.range(at: 1), in: result)
+			else { continue }
+			result.replaceSubrange(range, with: "\(result[keywordRange]) \(replacement)")
+		}
+		return result
 	}
 
 	/// Maps equality constraints on a dependent predicate onto the columns of a recursive body
@@ -219,7 +246,9 @@ extension RBDB {
 		case .boolean, .string: return nil
 		case .expression(let e):
 			// Move the `v`-free operand to the other side, then recurse into the one holding `v`.
-			func across(_ withV: Term, _ known: Term, _ undo: (Double, Double) -> Double?) -> Double? {
+			func across(_ withV: Term, _ known: Term, _ undo: (Double, Double) -> Double?)
+				-> Double?
+			{
 				guard withV.freeVariables.contains(v), !known.freeVariables.contains(v),
 					case .number(let c) = known, let inner = undo(target, c)
 				else { return nil }

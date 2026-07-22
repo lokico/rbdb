@@ -397,4 +397,368 @@ struct DatalogExtensionTests {
 		#expect(Array(try db.query(datalog: "squared(81)")).count == 1, "9² = 81")
 		#expect(Array(try db.query(datalog: "squared(30)")).count == 0)
 	}
+
+	@Test("mutual recursion between two predicates resolves via a combined tagged CTE")
+	func mutualRecursion() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE female(a)")
+		try db.query(sql: "CREATE TABLE son(a, b)")
+		try db.query(sql: "CREATE TABLE daughter(a, b)")
+		try db.query(sql: "CREATE TABLE parent(a, b)")
+		try db.query(sql: "CREATE TABLE grandparent(a, b)")
+
+		try db.assert(datalog: "female('Sophie')")
+		try db.assert(datalog: "son('Alex', 'Joe')")
+		try db.assert(datalog: "son('Henry', 'Alex')")
+		try db.assert(datalog: "son('Enda', 'Sophie')")
+		try db.assert(datalog: "daughter('Maeve', 'Alex')")
+		try db.assert(datalog: "daughter('Amy', 'Geordie')")
+		try db.assert(datalog: "daughter('Cara', 'Sophie')")
+		try db.assert(datalog: "parent('Geordie', 'Sophie')")
+
+		// `parent` and `daughter` are mutually recursive: `parent` is derived from `daughter` (and
+		//  `son`), while `daughter` is derived from `parent`. Neither predicate is self-recursive, so
+		//  the cycle can only be expressed as a single combined `WITH RECURSIVE` CTE.
+		try db.assert(datalog: "parent(A, B) :- son(B, A)")
+		try db.assert(datalog: "parent(A, B) :- daughter(B, A)")
+		try db.assert(datalog: "daughter(A, B) :- female(A), parent(B, A)")
+		try db.assert(datalog: "grandparent(A, B) :- parent(A, C), parent(C, B)")
+
+		func pairs(_ datalog: String) throws -> Set<[String]> {
+			Set(
+				try db.query(datalog: datalog).map { row in
+					[row["A"] as! String, row["B"] as! String]
+				})
+		}
+
+		// `daughter` closes over `parent`, which closes back over `daughter`. Sophie is female and
+		//  Geordie is her parent (asserted fact), so daughter(Sophie, Geordie) must be derived — that
+		//  derivation is only reachable *through* the mutual cycle.
+		let daughters = try pairs("daughter(A, B)")
+		#expect(daughters.contains(["Maeve", "Alex"]), "asserted daughter fact")
+		#expect(
+			daughters.contains(["Sophie", "Geordie"]),
+			"Sophie is female and Geordie is her parent ⟹ daughter(Sophie, Geordie)")
+
+		// A predicate that merely depends on the cycle (`grandparent → parent`) must also resolve.
+		// `son('Alex','Joe')` ⟹ `parent('Joe','Alex')` and `son('Henry','Alex')` ⟹
+		//  `parent('Alex','Henry')`, so Joe is Henry's grandparent.
+		let grandparents = try pairs("grandparent(A, B)")
+		#expect(grandparents.contains(["Joe", "Henry"]), "Joe → Alex → Henry")
+
+		// A bound query against a cycle member returns just the matching rows (only `A` is selected,
+		//  since `B` is pinned to the constant). Geordie is Sophie's only parent.
+		let sophiesParents = Set(
+			try db.query(datalog: "parent(A, 'Sophie')").map { $0["A"] as! String })
+		#expect(sophiesParents == ["Geordie"], "Geordie is Sophie's only parent: \(sophiesParents)")
+
+		// Raw SQL against the predicate views must resolve too. Unlike the datalog path, `SELECT * FROM
+		//  daughter` references the table *unbracketed*, so the closure must expose the predicate under
+		//  its own name (rather than rewriting a bracketed `FROM [daughter]`), for both a cycle member
+		//  (`daughter`) and a predicate that merely depends on the cycle (`grandparent`).
+		#expect(
+			try Array(db.query(sql: "SELECT * FROM daughter")).count
+				== daughters.count, "raw SQL over a cycle member matches the datalog query")
+		#expect(
+			try Array(db.query(sql: "SELECT * FROM grandparent")).count
+				== grandparents.count, "raw SQL over a cycle-dependent predicate matches too")
+	}
+
+	@Test("non-linear recursion evaluates via iterative fixpoint materialization")
+	func nonLinearRecursion() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE edge(a, b)")
+		try db.query(sql: "CREATE TABLE path(a, b)")
+
+		try db.assert(datalog: "edge(1, 2)")
+		try db.assert(datalog: "edge(2, 3)")
+		try db.assert(datalog: "edge(3, 4)")
+
+		// The transitive-closure rule joins two occurrences of the *same* recursive predicate
+		//  (`path`, `path`), which is genuinely non-linear — a shape SQLite's linear recursive CTE
+		//  cannot express. The finite iterative evaluator handles it because each step is a plain join.
+		try db.assert(datalog: "path(X, Y) :- edge(X, Y)")
+		try db.assert(datalog: "path(X, Z) :- path(X, Y), path(Y, Z)")
+
+		func pairs(_ datalog: String) throws -> Set<[Int]> {
+			Set(
+				try db.query(datalog: datalog).map { row in
+					[Int(row["A"] as! Int64), Int(row["B"] as! Int64)]
+				})
+		}
+
+		// Every reachable pair, both direct edges and multi-hop transitive paths.
+		let paths = try pairs("path(A, B)")
+		#expect(
+			paths == [[1, 2], [2, 3], [3, 4], [1, 3], [2, 4], [1, 4]],
+			"transitive closure of the 1→2→3→4 chain: \(paths)")
+
+		// A bound query against the non-linear predicate returns just the matching rows.
+		let fromOne = Set(try db.query(datalog: "path(1, B)").map { Int($0["B"] as! Int64) })
+		#expect(fromOne == [2, 3, 4], "everything reachable from 1: \(fromOne)")
+	}
+
+	@Test("a freshly opened DB materializes a base-fact-only predicate referenced within the cone")
+	func freshConnectionBaseFactInCone() async throws {
+		// Predicate "tables" exist only as per-connection TEMP views, created lazily. When a DB is
+		//  opened fresh, none exist yet. The iterative evaluator materializes *derived* cone predicates
+		//  as temp tables but references *base-fact-only* ones (here `tagged`) by name — so their view
+		//  must be created on demand, else the seeding join fails with "no such table: tagged". This
+		//  regression only reproduces across a fresh connection (same-connection tests create the views
+		//  eagerly at CREATE TABLE time, masking it).
+		let path = NSTemporaryDirectory() + "rbdb-fresh-\(UUID().uuidString).db"
+		defer { try? FileManager.default.removeItem(atPath: path) }
+
+		do {
+			let setup = try RBDB(path: path)
+			try setup.query(sql: "CREATE TABLE edge(a, b)")
+			try setup.query(sql: "CREATE TABLE tagged(a)")
+			try setup.query(sql: "CREATE TABLE reach(a, b)")
+
+			try setup.assert(datalog: "edge(1, 2)")
+			try setup.assert(datalog: "edge(2, 3)")
+			try setup.assert(datalog: "tagged(1)")
+
+			// `reach` is recursive (finite ⟹ iterative evaluator); its cone includes the base-fact-only
+			//  `tagged`, referenced by a rule body — the predicate whose view must be created on demand.
+			try setup.assert(datalog: "reach(X, Y) :- edge(X, Y), tagged(X)")
+			try setup.assert(datalog: "reach(X, Z) :- reach(X, Y), edge(Y, Z)")
+		}
+
+		// Separate connection: no predicate TEMP views exist. Querying the recursive predicate must
+		//  materialize `tagged`'s view rather than fail, and must return the *complete* closure.
+		let db = try RBDB(path: path)
+		let pairs = Set(
+			try db.query(datalog: "reach(A, B)").map { row in
+				[Int(row["A"] as! Int64), Int(row["B"] as! Int64)]
+			})
+		#expect(pairs == [[1, 2], [1, 3]], "closure seeded from tagged node 1: \(pairs)")
+	}
+
+	@Test("a mid-build failure leaves no partial materialization to silently return wrong rows")
+	func failedMaterializationDoesNotPersist() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE p(a, b)")
+
+		// A base fact so materialization *seeds* `p`'s temp table with a real row before the rule
+		//  that fails runs — the partial state that must not survive.
+		try db.assert(datalog: "p(1, 2)")
+
+		// A recursive rule whose head arity (1) doesn't match `p`'s two columns. It passes `validate`
+		//  (which only checks unsafe variables), routes `p` to the iterative evaluator (self-referential,
+		//  no arithmetic ⟹ finite), and then fails at the fixpoint INSERT — a mid-build error after the
+		//  seed already populated the temp table.
+		try db.assert(datalog: "p(X) :- p(X, Y)")
+
+		// First query fails as expected (the evaluator runs the fixpoint eagerly, so `query` throws).
+		#expect(throws: (any Error).self) {
+			_ = try db.query(datalog: "p(A, B)")
+		}
+
+		// It must fail *again*, not silently resolve against a leftover, partially seeded `[p]` temp
+		//  table (which would return the seeded `(1, 2)` as if it were the complete relation).
+		#expect(throws: (any Error).self) {
+			_ = try db.query(datalog: "p(A, B)")
+		}
+	}
+
+	@Test("materialized cone is invalidated when a new fact is asserted or inserted")
+	func materializationInvalidation() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE edge(a, b)")
+		try db.query(sql: "CREATE TABLE path(a, b)")
+
+		try db.assert(datalog: "edge(1, 2)")
+		try db.assert(datalog: "edge(2, 3)")
+		try db.assert(datalog: "path(X, Y) :- edge(X, Y)")
+		try db.assert(datalog: "path(X, Z) :- path(X, Y), path(Y, Z)")
+
+		func reachableFromOne() throws -> Set<Int> {
+			Set(try db.query(datalog: "path(1, B)").map { Int($0["B"] as! Int64) })
+		}
+
+		// First query materializes the cone into temp tables.
+		#expect(try reachableFromOne() == [2, 3], "1 reaches 2 and 3")
+
+		// Asserting a new fact must drop the stale materialization so the re-query reflects it.
+		try db.assert(datalog: "edge(3, 4)")
+		#expect(try reachableFromOne() == [2, 3, 4], "extending the chain must be reflected")
+
+		// A fact inserted through raw SQL (via the base predicate's view → `_rule`) invalidates too.
+		try db.query(sql: "INSERT INTO edge (a, b) VALUES (4, 5)")
+		#expect(try reachableFromOne() == [2, 3, 4, 5], "raw-SQL fact insert must be reflected")
+	}
+
+	/// Sets up `tc` as the finite transitive closure of `edge` and materializes it, returning the DB.
+	private func materializedTransitiveClosure() throws -> RBDB {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE edge(a, b)")
+		try db.query(sql: "CREATE TABLE tc(a, b)")
+		try db.assert(datalog: "edge(1, 2)")
+		try db.assert(datalog: "edge(2, 3)")
+		try db.assert(datalog: "tc(X, Y) :- edge(X, Y)")
+		try db.assert(datalog: "tc(X, Z) :- tc(X, Y), edge(Y, Z)")
+		// First query materializes `tc` into a temp table (finite ⟹ iterative evaluator).
+		#expect(try Set(db.query(datalog: "tc(1, B)").map { Int($0["B"] as! Int64) }) == [2, 3])
+		return db
+	}
+
+	@Test(
+		"a rule that turns a materialized closure value-generating invalidates it, never loops",
+		.timeLimit(.minutes(1)))
+	func valueGeneratingFlipInvalidatesInsteadOfLooping() async throws {
+		let db = try materializedTransitiveClosure()
+
+		// Asserting a rule with arithmetic under recursion makes `tc` value-generating: its fixpoint no
+		//  longer terminates (each pass derives a fresh `Y+1`). The refresh must NOT try to re-iterate
+		//  it — it must invalidate instead, or this test hangs until the time limit trips.
+		try db.assert(datalog: "tc(X, Y + 1) :- tc(X, Y)")
+
+		// Any query triggers the refresh of the now-dirty `tc`. Query an unrelated predicate so the
+		//  refresh — not this statement — is what would loop if the guard were missing.
+		#expect(try db.query(datalog: "edge(A, B)").map { _ in 1 }.count == 2)
+
+		// The guard dropped `tc`'s materialization rather than re-iterating it.
+		let stillMaterialized = try Array(
+			db.query(
+				sql: "SELECT name FROM sqlite_temp_master WHERE type = 'table' AND name = 'tc'"))
+		#expect(
+			stillMaterialized.isEmpty, "the value-generating closure must be invalidated (dropped)")
+	}
+
+	@Test(
+		"after the value-generating flip, the predicate re-routes to the streaming CTE",
+		.timeLimit(.minutes(1)))
+	func valueGeneratingFlipReroutesToCTE() async throws {
+		let db = try materializedTransitiveClosure()
+		try db.assert(datalog: "tc(X, Y + 1) :- tc(X, Y)")
+
+		// Post-flip `tc` is value-generating, so a *ground* query bounds and streams via the CTE.
+		//  `tc(1, 5)` is reachable: 1→2→3 (edges) then +1 increments up to 5.
+		#expect(Array(try db.query(datalog: "tc(1, 3)")).first?["sat"] as? Int64 == 1)
+		#expect(Array(try db.query(datalog: "tc(1, 5)")).first?["sat"] as? Int64 == 1)
+		// `4` has no incoming edge and nothing reaches it, so it is not derivable.
+		#expect(Array(try db.query(datalog: "tc(4, 5)")).isEmpty, "tc(4, 5) is not derivable")
+	}
+
+	@Test("materialized cone is invalidated when a base fact is asserted — file-backed DB")
+	func materializationInvalidationOnDiskFact() async throws {
+		// Same as `materializationInvalidation`, but on a *file* database, where SQLite enforces table
+		//  locks that an in-memory DB does not — exercising the invalidation trigger's `DROP` under
+		//  those locks.
+		let path = NSTemporaryDirectory() + "rbdb-inval-fact-\(UUID().uuidString).db"
+		defer { try? FileManager.default.removeItem(atPath: path) }
+		let db = try RBDB(path: path)
+		try db.query(sql: "CREATE TABLE edge(a, b)")
+		try db.query(sql: "CREATE TABLE path(a, b)")
+		try db.assert(datalog: "edge(1, 2)")
+		try db.assert(datalog: "edge(2, 3)")
+		try db.assert(datalog: "path(X, Y) :- edge(X, Y)")
+		try db.assert(datalog: "path(X, Z) :- path(X, Y), path(Y, Z)")
+
+		func reachableFromOne() throws -> Set<Int> {
+			Set(try db.query(datalog: "path(1, B)").map { Int($0["B"] as! Int64) })
+		}
+
+		// First query materializes the cone into temp tables.
+		#expect(try reachableFromOne() == [2, 3], "1 reaches 2 and 3")
+
+		// Asserting a new base fact must invalidate the stale materialization so the re-query sees it.
+		try db.assert(datalog: "edge(3, 4)")
+		#expect(try reachableFromOne() == [2, 3, 4], "extending the chain must be reflected")
+	}
+
+	@Test("materialized table is invalidated when a new rule is asserted — file-backed DB")
+	func materializationInvalidationOnDiskRule() async throws {
+		// A new *rule* for a predicate that already has a materialized temp table must drop that table
+		//  (via the invalidation trigger) so the next query rematerializes with the rule. On a file DB
+		//  the table's lock is enforced, so this exercises the trigger's `DROP` against a live lock.
+		let path = NSTemporaryDirectory() + "rbdb-inval-rule-\(UUID().uuidString).db"
+		defer { try? FileManager.default.removeItem(atPath: path) }
+		let db = try RBDB(path: path)
+		try db.query(sql: "CREATE TABLE edge(a, b)")
+		try db.query(sql: "CREATE TABLE path(a, b)")
+		try db.assert(datalog: "edge(1, 2)")
+		try db.assert(datalog: "edge(2, 3)")
+		try db.assert(datalog: "path(X, Y) :- edge(X, Y)")
+		try db.assert(datalog: "path(X, Z) :- path(X, Y), path(Y, Z)")
+
+		func reachableFromOne() throws -> Set<Int> {
+			Set(try db.query(datalog: "path(1, B)").map { Int($0["B"] as! Int64) })
+		}
+
+		// Materialize `path` into a temp table.
+		#expect(try reachableFromOne() == [2, 3], "1 reaches 2 and 3")
+
+		// Assert a new rule for the now-materialized `path`: `path(X, X) :- edge(X, Y)` adds a self-pair
+		//  for every node with an outgoing edge (so `path(1, 1)`). The materialized table must be dropped
+		//  and rebuilt for this to show up.
+		try db.assert(datalog: "path(X, X) :- edge(X, Y)")
+		#expect(
+			try reachableFromOne() == [1, 2, 3], "the new rule must be reflected (adds path(1, 1))")
+	}
+
+	/// Number of stored *rules* (Horn clauses with a body) for a predicate.
+	private func ruleCount(_ db: RBDB, _ predicate: String) throws -> Int {
+		try db.fetchRules(for: predicate).count
+	}
+
+	@Test("a tautological rule (head identical to a body literal) is not stored")
+	func tautologyDropped() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE p(a, b)")
+		try db.query(sql: "CREATE TABLE q(a, b)")
+
+		// `p(X, Y) :- p(X, Y), q(X, Y)` only ever re-derives rows `p` already has, so it derives
+		//  nothing new — it must be dropped rather than stored.
+		try db.assert(datalog: "p(X, Y) :- p(X, Y), q(X, Y)")
+		#expect(try ruleCount(db, "p") == 0, "tautology should not be stored")
+	}
+
+	@Test("duplicate body literals are collapsed before storing")
+	func duplicateBodyLiteralsCollapsed() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE p(a)")
+		try db.query(sql: "CREATE TABLE q(a)")
+
+		try db.assert(datalog: "p(X) :- q(X), q(X)")
+
+		let rules = try db.fetchRules(for: "p")
+		#expect(rules.count == 1, "one rule stored")
+		guard case .hornClause(_, let body) = rules.first else {
+			Issue.record("expected a Horn clause")
+			return
+		}
+		#expect(body.count == 1, "the duplicate `q(X)` literal is collapsed: \(body)")
+	}
+
+	@Test("a more general rule subsumes a more specific one, order-independently")
+	func subsumptionRemovesRedundantRule() async throws {
+		func storedRule(_ order: (RBDB) throws -> Void) throws -> Formula {
+			let db = try RBDB(path: ":memory:")
+			try db.query(sql: "CREATE TABLE anc(a, b)")
+			try db.query(sql: "CREATE TABLE parent(a, b)")
+			try order(db)
+			let rules = try db.fetchRules(for: "anc")
+			#expect(rules.count == 1, "exactly the general rule remains")
+			return rules[0]
+		}
+
+		// `anc(X, Y) :- parent(X, Y)` is strictly more general than
+		//  `anc(X, Y) :- parent(X, Y), parent(Y, Z)` (a subset of its body constraints), so whichever
+		//  order they're asserted in, only the general rule is left standing — and it's the same rule.
+		let generalFirst = try storedRule { db in
+			try db.assert(datalog: "anc(X, Y) :- parent(X, Y)")
+			try db.assert(datalog: "anc(X, Y) :- parent(X, Y), parent(Y, Z)")
+		}
+		let specificFirst = try storedRule { db in
+			try db.assert(datalog: "anc(X, Y) :- parent(X, Y), parent(Y, Z)")
+			try db.assert(datalog: "anc(X, Y) :- parent(X, Y)")
+		}
+		#expect(
+			generalFirst.canonicalize() == specificFirst.canonicalize(),
+			"the stored set is order-independent")
+		guard case .hornClause(_, let body) = generalFirst.canonicalize() else { return }
+		#expect(body.count == 1, "the surviving rule is the general one: \(body)")
+	}
 }

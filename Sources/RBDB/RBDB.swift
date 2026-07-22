@@ -8,6 +8,10 @@ public enum RBDBError: Error {
 public class RBDB: SQLiteDatabase {
 	private var isInitializing = false
 
+	// Guards `refreshDirtyMaterializations` against re-entering itself: the refresh runs queries of its
+	//  own (re-iterating closures), and those must not kick off another refresh pass.
+	var isRefreshing = false
+
 	// FIXME: Can we validate that it's actually an RBDB?
 	public override init(path: String) throws {
 		try super.init(path: path)
@@ -68,6 +72,10 @@ public class RBDB: SQLiteDatabase {
 
 	@discardableResult
 	public override func query(sql: SQL) throws -> SQLiteCursor {
+		// Bring any materialized closures the `_rule` trigger flagged stale up to date before reading.
+		//  Done here rather than in the trigger so it runs at a safe point — re-iterating, never
+		//  dropping — which sidesteps the on-disk table lock. See `refreshDirtyMaterializations`.
+		try refreshDirtyMaterializations()
 		do {
 			return try RBDBCursor(self, sql: sql)
 		} catch let error as SQLiteError {
@@ -86,15 +94,17 @@ public class RBDB: SQLiteDatabase {
 		// Validate the formula (predicates exist, no unsafe variables, etc.)
 		try validate(formula: formula)
 
-		let jsonStr = try formulaToJSON(formula)
-
 		try super.query(sql: "BEGIN TRANSACTION")
 		do {
-			try super.query(
-				sql: sqlForInsert(
-					ofFormula: jsonStr,
-					usingParameters: true
-				))
+			// Canonicalize the rule set (tautology drop, subsumption, literal dedup) in the same
+			//  transaction — this may remove already-stored rules, and returns nil to store nothing.
+			if let toStore = try canonicalizeRuleForAssert(formula) {
+				try super.query(
+					sql: sqlForInsert(
+						ofFormula: try formulaToJSON(toStore),
+						usingParameters: true
+					))
+			}
 			try super.query(sql: "COMMIT")
 		} catch {
 			try super.query(sql: "ROLLBACK")
@@ -224,9 +234,7 @@ public class RBDB: SQLiteDatabase {
 			"""
 	}
 
-	private func createViewAndTrigger(for tableName: String, columns: [String], rules: [Formula])
-		throws
-	{
+	func createViewAndTrigger(for tableName: String, columns: [String], rules: [Formula]) throws {
 		let columnList = columns.map { "[\($0)]" }.joined(separator: ", ")
 
 		var selects = [baseFactsSelect(for: tableName, columns: columns)]
@@ -323,28 +331,32 @@ public class RBDB: SQLiteDatabase {
 			return nil
 		}
 		let predicateName = String(match.1)
+		var retrySQL = sql.at(startIndex: startIndex)
 
-		let retrySQL: SQL
 		if try involvesRecursion(predicateName) {
-			// A predicate that (transitively) involves recursion can't be a plain view: it only ever
-			//  exists as a query-time CTE, and a view body can't reference a CTE. So we materialize the
-			//  whole recursive closure — the predicate plus every recursive predicate it depends on —
-			//  as CTEs in one `WITH RECURSIVE` statement prepended to the failing query.
-			//
-			// We can't push the bounds via a plain view either: SQLite won't push the query's WHERE
-			//  down into the recursive arm of a CTE, so the recursion wouldn't terminate. Instead we
-			//  derive the bounds ourselves and inject them into each recursive step.
-			// See https://github.com/sqlite/sqlite/blob/6176034151d10b29a38b0e67f27818a719c68139/src/select.c#L5054
-			retrySQL = try buildRecursiveClosureCTE(
-				topPredicate: predicateName,
-				topColumns: columnNames,
-				sql: sql,
-				startIndex: startIndex
-			)
+			// A predicate that (transitively) involves recursion can't be a plain view. Route by shape:
+
+			if try coneIsFinite(predicateName) {
+				// A *finite* (purely relational) cone — mutual, non-linear, or plain — is evaluated by
+				//  iterative fixpoint materialization, which terminates and handles every shape uniformly.
+				try materialize(topPredicate: predicateName)
+			} else {
+				// A cone containing a *value-generating* predicate (arithmetic under recursion: `nat`,
+				//  `square`, `inc`) is materialized as CTEs in one `WITH RECURSIVE` statement prepended to
+				//  the failing query — only the CTE can *stream* an otherwise-infinite relation.
+				//  We can't wrap that in a view because SQLite wouldn't push the query's WHERE clause
+				//  down into the recursive arm of the CTE, so the recursion wouldn't terminate. Instead we
+				//  derive the bounds ourselves and inject them into each recursive step.
+				// See https://github.com/sqlite/sqlite/blob/6176034151d10b29a38b0e67f27818a719c68139/src/select.c#L5054
+				retrySQL = try buildRecursiveClosureCTE(
+					topPredicate: predicateName,
+					topColumns: columnNames,
+					sql: retrySQL,
+				)
+			}
 		} else {
 			let rules = try fetchRules(for: predicateName)
 			try createViewAndTrigger(for: predicateName, columns: columnNames, rules: rules)
-			retrySQL = sql.at(startIndex: startIndex)
 		}
 		return try query(sql: retrySQL)
 	}

@@ -408,3 +408,120 @@ func multipleFactsMultipleInferences() async throws {
 	let ancestorResults = try rbdb.query(sql: "SELECT * FROM ancestor")
 	#expect(Array(ancestorResults).count == 3)
 }
+
+// Regression: a predicate queried while it wasn't yet recursive gets a plain TEMP VIEW (with an
+// `INSTEAD OF INSERT` trigger). A later rule can drag it into a *finite recursive cone*, making it a
+// derived member of an iterative materialization. `materialize` must drop that shadowing view before
+// creating the temp table: otherwise `CREATE TABLE IF NOT EXISTS` no-ops against the view and the
+// fixpoint's `INSERT OR IGNORE` fires the view's trigger — asserting base facts into `_rule` (never
+// dedup'd) instead of filling a table, so `total_changes` never settles and the fixpoint spins forever.
+@Test(.timeLimit(.minutes(1)))
+func recursiveConeReclaimsPredicateFromPlainView() throws {
+	let rbdb = try RBDB(path: ":memory:")
+	try rbdb.query(sql: "CREATE TABLE foo(x)")
+	try rbdb.query(sql: "CREATE TABLE bar(x)")
+
+	let X = Var()
+	// foo("foo"); foo(X) :- bar(X); bar("Bar")
+	try rbdb.assert(formula: .predicate(Predicate(name: "foo", arguments: [.string("foo")])))
+	try rbdb.assert(
+		formula: .hornClause(
+			positive: Predicate(name: "foo", arguments: [.variable(X)]),
+			negative: [Predicate(name: "bar", arguments: [.variable(X)])]))
+	try rbdb.assert(formula: .predicate(Predicate(name: "bar", arguments: [.string("Bar")])))
+
+	// Query foo now, while it isn't recursive yet: this creates a plain TEMP VIEW named `foo`.
+	_ = Array(try rbdb.query(sql: "SELECT * FROM foo"))
+
+	try rbdb.query(sql: "CREATE TABLE baz(x)")
+	// foo(X) :- baz(X) — foo now (transitively) depends on baz.
+	try rbdb.assert(
+		formula: .hornClause(
+			positive: Predicate(name: "foo", arguments: [.variable(X)]),
+			negative: [Predicate(name: "baz", arguments: [.variable(X)])]))
+	// Query foo again so the plain view for `foo` is (re)created while it's still non-recursive.
+	_ = Array(try rbdb.query(sql: "SELECT * FROM foo"))
+
+	try rbdb.assert(formula: .predicate(Predicate(name: "baz", arguments: [.string("Bazzzz")])))
+	try rbdb.query(sql: "DROP VIEW baz")
+	// baz(X) :- bar(X), foo(X) — closes the cycle baz → foo → baz, a finite recursive cone whose
+	//  members (incl. the still-view `foo`) must be materialized as temp tables.
+	try rbdb.assert(
+		formula: .hornClause(
+			positive: Predicate(name: "baz", arguments: [.variable(X)]),
+			negative: [
+				Predicate(name: "bar", arguments: [.variable(X)]),
+				Predicate(name: "foo", arguments: [.variable(X)]),
+			]))
+
+	// Must terminate (no runaway fixpoint) and give the right relational answer:
+	//  foo = {foo, Bar, Bazzzz}; baz = base {Bazzzz} ∪ (bar ∩ foo = {Bar}) = {Bar, Bazzzz}.
+	let baz = Set(
+		Array(try rbdb.query(sql: "SELECT * FROM baz")).compactMap { $0["x"] as? String })
+	#expect(baz == ["Bar", "Bazzzz"])
+}
+
+// Regression: an earlier schema shipped a *persistent* `_drop_temp_view_on_rule_insert` trigger that
+// ran `DROP VIEW IF EXISTS <predicate>` unconditionally on every `_rule` insert. Once a predicate can be
+// materialized as a temp *table* (IterativeEvaluator), that unguarded DROP VIEW aborts with "use DROP
+// TABLE" when a new rule targets a currently-materialized predicate. Opening a pre-existing DB must
+// migrate the stale trigger away (it lives in `main`, so it persists across connections).
+@Test func staleDropViewTriggerIsMigratedAway() throws {
+	let path = NSTemporaryDirectory() + "rbdb-stale-trigger-\(UUID().uuidString).db"
+	defer { try? FileManager.default.removeItem(atPath: path) }
+
+	// Session 1: build a finite, mutually-recursive predicate `p` (so it materializes as a temp table),
+	//  then plant the obsolete persistent trigger to simulate a database created by the older schema.
+	do {
+		let rbdb = try RBDB(path: path)
+		try rbdb.query(sql: "CREATE TABLE base(x)")
+		try rbdb.query(sql: "CREATE TABLE p(x)")
+		try rbdb.query(sql: "CREATE TABLE q(x)")
+		try rbdb.query(sql: "CREATE TABLE r(x)")
+
+		let X = Var()
+		// p(X) :- base(X); p(X) :- q(X); q(X) :- p(X)  — p and q are mutually recursive (finite).
+		try rbdb.assert(
+			formula: .hornClause(
+				positive: Predicate(name: "p", arguments: [.variable(X)]),
+				negative: [Predicate(name: "base", arguments: [.variable(X)])]))
+		try rbdb.assert(
+			formula: .hornClause(
+				positive: Predicate(name: "p", arguments: [.variable(X)]),
+				negative: [Predicate(name: "q", arguments: [.variable(X)])]))
+		try rbdb.assert(
+			formula: .hornClause(
+				positive: Predicate(name: "q", arguments: [.variable(X)]),
+				negative: [Predicate(name: "p", arguments: [.variable(X)])]))
+		try rbdb.assert(formula: .predicate(Predicate(name: "base", arguments: [.string("a")])))
+
+		// Plant the obsolete trigger exactly as the old schema created it (persistent, unguarded).
+		try rbdb.query(
+			sql: SQL(
+				"""
+				CREATE TRIGGER _drop_temp_view_on_rule_insert
+				AFTER INSERT ON _rule
+				WHEN NEW.negative_literal_count > 0
+				BEGIN
+				  SELECT sql_exec('DROP VIEW IF EXISTS ' || substr(NEW.output_type, 2));
+				END
+				"""))
+	}
+
+	// Session 2: reopening runs the schema migration, which must drop the stale trigger.
+	let rbdb = try RBDB(path: path)
+	let triggers = Array(
+		try rbdb.query(
+			sql: "SELECT name FROM sqlite_schema WHERE type = 'trigger'")
+	).compactMap { $0["name"] as? String }
+	#expect(!triggers.contains("_drop_temp_view_on_rule_insert"))
+
+	// Materialize `p` as a temp table, then assert a new rule for it. Before the migration this aborted
+	//  with "use DROP TABLE to delete table p"; now it must succeed.
+	_ = Array(try rbdb.query(sql: "SELECT * FROM p"))
+	let X = Var()
+	try rbdb.assert(
+		formula: .hornClause(
+			positive: Predicate(name: "p", arguments: [.variable(X)]),
+			negative: [Predicate(name: "r", arguments: [.variable(X)])]))
+}
