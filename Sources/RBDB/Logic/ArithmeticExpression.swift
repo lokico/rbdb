@@ -11,7 +11,7 @@ import Foundation
 /// the only way to *build* an expression is through the normalizing factories on `Term`
 /// (`Term.sum`, `Term.product`, `Term.power`, …). There is deliberately no subtract or divide
 /// case — they lower to add/multiply/exponent.
-public struct Expression: Comparable, CustomDebugStringConvertible {
+public struct ArithmeticExpression: Comparable, CustomDebugStringConvertible {
 	package enum Raw: Comparable {
 		case add(Term, Term)
 		case multiply(Term, Term)
@@ -57,7 +57,7 @@ public struct Expression: Comparable, CustomDebugStringConvertible {
 		self.raw = raw
 	}
 
-	// Not public because it's possible to create a non-canonical expression, e.g. Expression(.add, .number(1), .number(2))
+	// Not public because it's possible to create a non-canonical expression, e.g. ArithmeticExpression(.add, .number(1), .number(2))
 	package init(_ op: Op, _ t1: Term, _ t2: Term) {
 		switch op {
 		case .add: self.raw = .add(t1, t2)
@@ -67,18 +67,22 @@ public struct Expression: Comparable, CustomDebugStringConvertible {
 	}
 
 	// Comparable is never synthesized for a struct, so forward to the synthesized ordering on `raw`.
-	public static func == (lhs: Expression, rhs: Expression) -> Bool { lhs.raw == rhs.raw }
-	public static func < (lhs: Expression, rhs: Expression) -> Bool { lhs.raw < rhs.raw }
+	public static func == (lhs: ArithmeticExpression, rhs: ArithmeticExpression) -> Bool {
+		lhs.raw == rhs.raw
+	}
+	public static func < (lhs: ArithmeticExpression, rhs: ArithmeticExpression) -> Bool {
+		lhs.raw < rhs.raw
+	}
 }
 
-extension Expression: Codable {
+extension ArithmeticExpression: Codable {
 	public init(from decoder: Decoder) throws {
 		let c = try decoder.container(keyedBy: Op.self)
 		guard let op = c.allKeys.last else {
 			throw DecodingError.dataCorrupted(
 				DecodingError.Context(
 					codingPath: decoder.codingPath,
-					debugDescription: "No valid expression operation key found"
+					debugDescription: "No valid ArithmeticExpression operation key found"
 				)
 			)
 		}
@@ -97,6 +101,21 @@ extension Expression: Codable {
 	public func encode(to encoder: Encoder) throws {
 		var c = encoder.container(keyedBy: Op.self)
 		try c.encode(operands, forKey: operation)
+	}
+}
+
+extension Formula {
+	/// Returns `true` if this `Formula` contains any arithmetic (`.arithmetic`) anywhere it its head *or* body.
+	public var doesArithmetic: Bool {
+		switch self {
+		case .hornClause(let head, let bodies):
+			func any(_ predicate: Predicate) -> Bool {
+				predicate.arguments.contains {
+					if case .arithmetic = $0 { return true } else { return false }
+				}
+			}
+			return any(head) || bodies.contains(where: any)
+		}
 	}
 }
 
@@ -184,7 +203,7 @@ extension Term {
 	/// The canonical power `base ^ exponent`.
 	public static func power(_ base: Term, _ exponent: Term) -> Term {
 		// (aᵇ)ᶜ → a^(b·c)
-		if case .expression(let e) = base, case .exponent(let b, let bExp) = e.raw {
+		if case .arithmetic(let e) = base, case .exponent(let b, let bExp) = e.raw {
 			return power(b, product(bExp, exponent))
 		}
 		if let e = numericValue(exponent) {
@@ -196,7 +215,7 @@ extension Term {
 			}
 		}
 		if let b = numericValue(base), b == 1 { return .number(1) }  // 1^x → 1
-		return .expression(Expression(.exponent(base, exponent)))
+		return .arithmetic(ArithmeticExpression(.exponent(base, exponent)))
 	}
 
 	// Variadic conveniences.
@@ -235,8 +254,8 @@ private func foldFinite(_ values: [Double], _ combine: (Double, Double) -> Doubl
 }
 
 /// Flattens a same-operator chain (`add` or `multiply`) into its leaf operands.
-private func flatten(_ term: Term, _ op: Expression.Op, into leaves: inout [Term]) {
-	if case .expression(let e) = term, e.operation == op {
+private func flatten(_ term: Term, _ op: ArithmeticExpression.Op, into leaves: inout [Term]) {
+	if case .arithmetic(let e) = term, e.operation == op {
 		for operand in e.operands {
 			flatten(operand, op, into: &leaves)
 		}
@@ -248,7 +267,7 @@ private func flatten(_ term: Term, _ op: Expression.Op, into leaves: inout [Term
 /// Splits an addend into `(coefficient, monomial)`; a `nil` monomial denotes a pure constant.
 private func splitCoefficient(_ term: Term) -> (Double, Term?) {
 	if let n = numericValue(term) { return (n, nil) }
-	if case .expression(let e) = term, case .multiply = e.raw {
+	if case .arithmetic(let e) = term, case .multiply = e.raw {
 		var factors: [Term] = []
 		flatten(term, .multiply, into: &factors)
 		let numbers = factors.compactMap(numericValue)
@@ -263,17 +282,17 @@ private func splitCoefficient(_ term: Term) -> (Double, Term?) {
 
 /// Splits a factor into `(base, exponent)`; a bare term is treated as `term^1`.
 private func splitPower(_ term: Term) -> (Term, Term) {
-	if case .expression(let e) = term, case .exponent(let base, let exponent) = e.raw {
+	if case .arithmetic(let e) = term, case .exponent(let base, let exponent) = e.raw {
 		return (base, exponent)
 	}
 	return (term, .number(1))
 }
 
 /// Right-nests a sorted, non-empty operand list into a canonical binary tree.
-private func nest(_ sorted: [Term], _ op: Expression.Op) -> Term {
+private func nest(_ sorted: [Term], _ op: ArithmeticExpression.Op) -> Term {
 	var accumulator = sorted[sorted.count - 1]
 	for term in sorted[..<(sorted.count - 1)].reversed() {
-		accumulator = .expression(Expression(op, term, accumulator))
+		accumulator = .arithmetic(ArithmeticExpression(op, term, accumulator))
 	}
 	return accumulator
 }

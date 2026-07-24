@@ -244,7 +244,7 @@ extension RBDB {
 		case .variable(let u): return u == v ? target : nil
 		case .number(let n): return n == target ? target : nil
 		case .boolean, .string: return nil
-		case .expression(let e):
+		case .arithmetic(let e):
 			// Move the `v`-free operand to the other side, then recurse into the one holding `v`.
 			func across(_ withV: Term, _ known: Term, _ undo: (Double, Double) -> Double?)
 				-> Double?

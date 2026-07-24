@@ -2,11 +2,11 @@ public enum SymbolType: Comparable {
 	// terms
 	case constant
 	case variable
-	case expression
+	case arithmetic
 
 	public var isTerm: Bool {
 		switch self {
-		case .constant, .variable, .expression: true
+		case .constant, .variable, .arithmetic: true
 		default: false
 		}
 	}
@@ -48,7 +48,7 @@ extension SymbolType: CodingKey {
 		switch self {
 		case .constant: ""
 		case .variable: "v"
-		case .expression: "x"
+		case .arithmetic: "x"
 		case .hornClause(positiveName: let name): "@\(name)"
 		}
 	}
@@ -59,7 +59,7 @@ extension SymbolType: CodingKey {
 			switch stringValue {
 			case "": self = .constant
 			case "v": self = .variable
-			case "x": self = .expression
+			case "x": self = .arithmetic
 			default: return nil
 			}
 		}

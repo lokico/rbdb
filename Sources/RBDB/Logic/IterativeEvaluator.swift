@@ -22,24 +22,11 @@ extension RBDB {
 		return cone
 	}
 
-	/// Whether rule `R` contains any arithmetic (`.expression`) anywhere — head *or* body. Value
-	/// generation isn't visible from the head alone: `nat(X) :- nat(X - 1)` has a bare-variable head
-	/// and generates values by inverting the body expression, so the whole clause must be scanned.
-	private func doesArithmetic(_ rule: Formula) -> Bool {
-		guard case .hornClause(let head, let bodies) = rule else { return false }
-		func any(_ predicate: Predicate) -> Bool {
-			predicate.arguments.contains {
-				if case .expression = $0 { return true } else { return false }
-			}
-		}
-		return any(head) || bodies.contains(where: any)
-	}
-
 	/// Whether `name` is value-generating: it involves recursion *and* some rule of it does arithmetic.
 	/// Arithmetic on a recursion-carrying predicate is the marker of a relation that can escape the
 	/// finite active domain (`nat`, `square`, `inc`) — such predicates must stream via the CTE.
 	private func valueGenerating(_ name: String) throws -> Bool {
-		try involvesRecursion(name) && fetchRules(for: name).contains(where: doesArithmetic)
+		try involvesRecursion(name) && fetchRules(for: name).contains { $0.doesArithmetic }
 	}
 
 	/// Whether the dependency cone of `predicate` is purely finite (relational) recursion — i.e. no
@@ -77,15 +64,6 @@ extension RBDB {
 		//  query would read it as if complete and silently return wrong rows. On failure we drop them so
 		//  the next query re-fails cleanly on the missing table and rematerializes from current data.
 		var touched: [String] = []
-		func discardPartialMaterialization() {
-			for name in touched {
-				// `SQL(String)` takes the text verbatim; interpolating into an `SQL` literal would bind
-				//  the name as a parameter (as the parameterized statements further below do).
-				let drop = "DROP TABLE IF EXISTS [\(name)]"
-				_ = try? super.query(sql: SQL(drop))
-			}
-		}
-
 		do {
 			// 1. Create a temp table per derived predicate (UNIQUE over all columns for `INSERT OR IGNORE`
 			//    dedup) and seed it with the predicate's base facts.
@@ -145,7 +123,10 @@ extension RBDB {
 				if sqlite3_total_changes(db) == before { break }
 			}
 		} catch {
-			discardPartialMaterialization()
+			for name in touched {
+				// Don't let failing to drop one table prevent us from dropping the rest..
+				_ = try? invalidateMaterialization(name)
+			}
 			throw error
 		}
 
@@ -170,7 +151,7 @@ extension RBDB {
 		isRefreshing = true
 		defer { isRefreshing = false }
 
-		let dirty = try super.query(sql: "SELECT name FROM _dirty")
+		let dirty = try super.query(sql: "DELETE FROM _dirty RETURNING name")
 			.compactMap { $0["name"] as? String }
 		guard !dirty.isEmpty else { return }
 
@@ -180,11 +161,10 @@ extension RBDB {
 			} else {
 				// A newly-asserted rule made the cone value-generating (arithmetic under recursion): the
 				//  iterative fixpoint would no longer terminate. Drop the closure so the next query routes
-				//  it to the streaming CTE instead. Safe to drop here — no statement is in flight.
+				//  it to the streaming CTE instead.
 				try invalidateMaterialization(name)
 			}
 		}
-		try super.query(sql: "DELETE FROM _dirty")
 	}
 
 	/// If `name` exists and is a view, drops it. Otherwise does nothing.

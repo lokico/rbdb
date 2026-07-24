@@ -142,7 +142,7 @@ import Testing
 
 @Test func canonicalizeNormalizesRawNonCanonicalExpression() throws {
 	// A raw (package-constructed) non-canonical expression must be normalized by canonicalize().
-	let rawFolds = Term.expression(Expression(.add(.number(1), .number(2))))
+	let rawFolds = Term.arithmetic(ArithmeticExpression(.add(.number(1), .number(2))))
 	let formula = Formula.hornClause(
 		positive: Predicate(name: "p", arguments: [rawFolds]), negative: [])
 	let expected = Formula.hornClause(

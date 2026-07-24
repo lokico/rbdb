@@ -7,13 +7,13 @@ public enum Term: Symbol, CustomDebugStringConvertible {
 	case string(String)
 
 	// expressions
-	indirect case expression(Expression)
+	indirect case arithmetic(ArithmeticExpression)
 
 	public var type: SymbolType {
 		switch self {
 		case .variable: .variable
 		case .boolean, .number, .string: .constant
-		case .expression: .expression
+		case .arithmetic: .arithmetic
 		}
 	}
 
@@ -23,7 +23,7 @@ public enum Term: Symbol, CustomDebugStringConvertible {
 		case .boolean(let v): v ? "true" : "false"
 		case .number(let v): String(v)
 		case .string(let v): "\"\(v)\""
-		case .expression(let expr): "(\(expr.debugDescription))"
+		case .arithmetic(let expr): "(\(expr.debugDescription))"
 		}
 	}
 
@@ -42,21 +42,21 @@ extension SymbolRewriter {
 		switch term {
 		case .variable(let v):
 			.variable(rewrite(variable: v))
-		case .expression(let expr):
-			.expression(rewrite(expression: expr))
+		case .arithmetic(let expr):
+			.arithmetic(rewrite(expression: expr))
 		default:
 			term
 		}
 	}
 	public func rewrite(variable: Var) -> Var { variable }
-	public func rewrite(expression: Expression) -> Expression {
+	public func rewrite(expression: ArithmeticExpression) -> ArithmeticExpression {
 		switch expression.raw {
 		case .add(let lhs, let rhs):
-			Expression(.add(rewrite(term: lhs), rewrite(term: rhs)))
+			ArithmeticExpression(.add(rewrite(term: lhs), rewrite(term: rhs)))
 		case .multiply(let lhs, let rhs):
-			Expression(.multiply(rewrite(term: lhs), rewrite(term: rhs)))
+			ArithmeticExpression(.multiply(rewrite(term: lhs), rewrite(term: rhs)))
 		case .exponent(let lhs, let rhs):
-			Expression(.exponent(rewrite(term: lhs), rewrite(term: rhs)))
+			ArithmeticExpression(.exponent(rewrite(term: lhs), rewrite(term: rhs)))
 		}
 	}
 }
@@ -67,7 +67,7 @@ extension Term {
 		switch self {
 		case .variable(let v): [v]
 		case .boolean, .number, .string: []
-		case .expression(let expr):
+		case .arithmetic(let expr):
 			switch expr.raw {
 			case .add(let l, let r), .multiply(let l, let r), .exponent(let l, let r):
 				l.freeVariables.union(r.freeVariables)
@@ -82,7 +82,7 @@ extension Term {
 		switch self {
 		case .variable(let v): v == variable ? 1 : 0
 		case .boolean, .number, .string: 0
-		case .expression(let expr):
+		case .arithmetic(let expr):
 			switch expr.raw {
 			case .add(let l, let r):
 				combineMonotonicity(l.monotonicity(in: variable), r.monotonicity(in: variable))
@@ -107,7 +107,7 @@ extension Term {
 		switch self {
 		case .variable(let v): return v == variable ? replacement : self
 		case .boolean, .number, .string: return self
-		case .expression(let e):
+		case .arithmetic(let e):
 			let sub = { (t: Term) in t.substituting(variable, with: replacement) }
 			switch e.raw {
 			case .add(let lhs, let rhs): return .sum(sub(lhs), sub(rhs))
@@ -129,7 +129,7 @@ extension SymbolReducer {
 		switch term {
 		case .variable(let v):
 			return try reduce(prev, v)
-		case .expression(let expr):
+		case .arithmetic(let expr):
 			return try reduce(prev, expr)
 		default:
 			return prev
@@ -137,7 +137,7 @@ extension SymbolReducer {
 	}
 
 	public func reduce(_ prev: Result, _ variable: Var) throws -> Result { prev }
-	public func reduce(_ prev: Result, _ expression: Expression) throws -> Result {
+	public func reduce(_ prev: Result, _ expression: ArithmeticExpression) throws -> Result {
 		switch expression.raw {
 		case .add(let lhs, let rhs),
 			.multiply(let lhs, let rhs),
@@ -189,8 +189,8 @@ extension Term: Codable {
 						)
 					)
 				}
-			case .expression:
-				self = .expression(try container.decode(Expression.self, forKey: key))
+			case .arithmetic:
+				self = .arithmetic(try container.decode(ArithmeticExpression.self, forKey: key))
 			default:
 				// should never get here
 				fatalError()
@@ -222,7 +222,7 @@ extension Term: Codable {
 		case .boolean(let value): try container.encode(value, forKey: .constant)
 		case .number(let value): try container.encode(value, forKey: .constant)
 		case .string(let value): try container.encode(value, forKey: .constant)
-		case .expression(let expr): try container.encode(expr, forKey: .expression)
+		case .arithmetic(let expr): try container.encode(expr, forKey: .arithmetic)
 		}
 	}
 }

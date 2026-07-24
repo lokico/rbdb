@@ -56,7 +56,7 @@ private func lower(term: Term, leaf: (Var) throws -> SQLExpression) rethrows -> 
 	case .number(let n): return String(n)
 	case .string(let s): return "'\(s)'"
 	case .variable(let v): return try leaf(v)
-	case .expression(let expr):
+	case .arithmetic(let expr):
 		switch expr.raw {
 		case .add(let lhs, let rhs):
 			return "(\(try lower(term: lhs, leaf: leaf)) + \(try lower(term: rhs, leaf: leaf)))"
@@ -97,7 +97,7 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 		switch expr {
 		case .variable(let u):
 			return u == v ? target : nil
-		case .expression(let e):
+		case .arithmetic(let e):
 			// Exactly one operand may contain `v`; the other is treated as a known and moved across.
 			func across(
 				_ withV: Term, _ known: Term, _ solved: (SQLExpression) -> SQLExpression
@@ -160,7 +160,7 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 					case .boolean, .number, .string:
 						sql.fromTables[index].conditions.append(
 							"\(column) = \(try termToSQL(term, cols))")
-					case .expression:
+					case .arithmetic:
 						// If every variable is already bound, this is a constraint. If exactly one is
 						//  unbound, try to bind it by inverting the expression against the column (this
 						//  is what lets the recursion variable live in the body, e.g. `nat(N) :- nat(N - 1)`).
@@ -219,7 +219,7 @@ fileprivate struct QueryIntoSQLReducer: SymbolReducer {
 					// Variables become part of the result set
 					// FIXME: Prevent SQL injection via variable name
 					sql.select.append("[\(table.effectiveName)].\(columnName) AS [\(v)]")
-				case .boolean, .number, .string, .expression:
+				case .boolean, .number, .string, .arithmetic:
 					// Expressions in queries go into WHERE clause
 					let sqlExpr = termToSQL(term, table, columnName)
 					table.conditions.append(

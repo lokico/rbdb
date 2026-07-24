@@ -303,8 +303,8 @@ private enum AddOp { case plus, minus }
 private enum MulOp { case times, divide }
 
 /// Flattens a same-operator (`add` or `multiply`) chain of `Term`s into its leaves for printing.
-private func flattenChain(_ term: Term, op: Expression.Op) -> [Term] {
-	guard case .expression(let e) = term, e.operation == op else { return [term] }
+private func flattenChain(_ term: Term, op: ArithmeticExpression.Op) -> [Term] {
+	guard case .arithmetic(let e) = term, e.operation == op else { return [term] }
 	return e.operands
 		.map {
 			flattenChain($0, op: op)
@@ -375,7 +375,7 @@ private struct ExponentFold: Conversion {
 	func unapply(_ output: Term) throws -> (Term, [Term]) {
 		var chain: [Term] = []
 		var current = output
-		while case .expression(let e) = current, case .exponent(let base, let exp) = e.raw {
+		while case .arithmetic(let e) = current, case .exponent(let base, let exp) = e.raw {
 			chain.append(base)
 			current = exp
 		}

@@ -22,7 +22,7 @@ class CanonicalizeRewriter: VariableMappingRewriter, SymbolRewriter {
 		switch term {
 		case .variable(let v):
 			.variable(rewrite(variable: v))
-		case .expression(let expr):
+		case .arithmetic(let expr):
 			switch expr.raw {
 			case .add(let l, let r):
 				Term.sum(rewrite(term: l), rewrite(term: r))

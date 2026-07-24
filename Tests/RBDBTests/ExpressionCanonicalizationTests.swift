@@ -22,12 +22,18 @@ struct ExpressionCanonicalizationTests {
 		#expect(Term.product(a, b) == Term.product(b, a))
 	}
 
-	@Test("grouped addition / multiplication")
-	func grouping() {
+	@Test("constant folding of grouped addition / multiplication")
+	func groupingConstants() {
 		#expect(Term.sum(Term.sum(.number(1), .number(2)), .number(3)) == .number(6))
 		#expect(Term.sum(.number(1), Term.sum(.number(2), .number(3))) == .number(6))
 		#expect(Term.product(Term.product(.number(1), .number(2)), .number(3)) == .number(6))
 		#expect(Term.product(.number(1), Term.product(.number(2), .number(3))) == .number(6))
+	}
+
+	@Test("symbolic grouped addition / multiplication")
+	func groupingVars() {
+		#expect(Term.sum(Term.sum(a, b), c) == Term.sum(a, Term.sum(b, c)))
+		#expect(Term.product(Term.product(a, b), c) == Term.product(a, Term.product(b, c)))
 	}
 
 	@Test("addition or multiplication")
@@ -118,7 +124,7 @@ struct ExpressionCanonicalizationTests {
 		let big = Term.number(1e308)
 		let doubled = Term.sum(big, big)
 		// The sum would overflow Double, so it must stay symbolic rather than fold to `inf`.
-		guard case .expression(let e) = doubled, case .add(let l, let r) = e.raw else {
+		guard case .arithmetic(let e) = doubled, case .add(let l, let r) = e.raw else {
 			Issue.record("expected an unfolded add, got \(doubled)")
 			return
 		}
