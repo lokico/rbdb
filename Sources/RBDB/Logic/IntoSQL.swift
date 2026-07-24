@@ -27,10 +27,15 @@ fileprivate struct SQLTable {
 fileprivate struct SQLSelect {
 	var select: [SQLExpression]
 	var fromTables: [SQLTable]
+	/// Conditions that hold of the row as a whole rather than of a particular table — they land in
+	/// the `WHERE` clause even when there is no `FROM` at all (SQLite allows a `FROM`-less `SELECT`
+	/// to carry a `WHERE`), which is what makes a body of nothing but guards filter correctly.
+	var conditions: [SQLExpression] = []
 	static var empty: SQLSelect { SQLSelect(select: [], fromTables: []) }
 
 	var sql: String {
 		var result = "SELECT DISTINCT \(select.joined(separator: ", "))"
+		var whereConditions = conditions
 
 		if let t1 = fromTables.first {
 			result += " FROM \(t1.fromClause)"
@@ -39,9 +44,11 @@ fileprivate struct SQLSelect {
 				result += " JOIN \(t2.fromClause) ON \(t2.conditions.joined(separator: " AND "))"
 			}
 
-			if !t1.conditions.isEmpty {
-				result += " WHERE \(t1.conditions.joined(separator: " AND "))"
-			}
+			whereConditions = t1.conditions + whereConditions
+		}
+
+		if !whereConditions.isEmpty {
+			result += " WHERE \(whereConditions.joined(separator: " AND "))"
 		}
 
 		return result
@@ -130,7 +137,7 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 	func reduce(_ prev: SQLSelect, _ formula: Formula) throws -> SQLSelect {
 		var sql = prev
 		switch formula {
-		case .hornClause(positive: let positive, negative: let negatives):
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
 			var cols: [Var: SQLExpression] = [:]
 			var tableNameCounts: [String: Int] = [:]
 
@@ -180,6 +187,16 @@ fileprivate struct RuleIntoSQLReducer: SymbolReducer {
 				}
 			}
 
+			// Guards are pure filters: both operands are already bound by a positive literal (enforced by
+			//  range-restriction validation), so each lowers to a boolean condition in the WHERE clause —
+			//  sound because every join here is an inner join, so a WHERE predicate and a JOIN…ON
+			//  predicate are interchangeable. A guard-only body has no table at all, and still filters.
+			for g in guards {
+				let lhs = try termToSQL(g.lhs, cols)
+				let rhs = try termToSQL(g.rhs, cols)
+				sql.conditions.append("\(lhs) \(g.operation.rawValue) \(rhs)")
+			}
+
 			// Generate SELECT clause based on the head predicate
 			let columnNames = try getColumnNames(positive.name)
 			for (i, term) in positive.arguments.enumerated() {
@@ -202,10 +219,15 @@ fileprivate struct QueryIntoSQLReducer: SymbolReducer {
 	func reduce(_ prev: SQLSelect, _ formula: Formula) throws -> SQLSelect {
 		var sql = prev
 		switch formula {
-		case .hornClause(positive: let predicate, negative: let negatives):
+		case .hornClause(positive: let predicate, negative: let negatives, guards: let guards):
 			// For queries, we don't allow negative literals for now
 			guard negatives.isEmpty else {
 				throw SQLiteError.queryError("Queries with negative literals are not supported")
+			}
+			// Guards need multi-literal (conjunctive) query support, which the single-literal query
+			//  reducer doesn't yet have; they are only supported in rule bodies for now.
+			guard guards.isEmpty else {
+				throw SQLiteError.queryError("Queries with comparison guards are not supported")
 			}
 
 			var table = SQLTable(name: predicate.name, alias: nil)

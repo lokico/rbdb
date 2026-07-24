@@ -725,7 +725,7 @@ struct DatalogExtensionTests {
 
 		let rules = try db.fetchRules(for: "p")
 		#expect(rules.count == 1, "one rule stored")
-		guard case .hornClause(_, let body) = rules.first else {
+		guard case .hornClause(_, let body, _) = rules.first else {
 			Issue.record("expected a Horn clause")
 			return
 		}
@@ -758,7 +758,7 @@ struct DatalogExtensionTests {
 		#expect(
 			generalFirst.canonicalize() == specificFirst.canonicalize(),
 			"the stored set is order-independent")
-		guard case .hornClause(_, let body) = generalFirst.canonicalize() else { return }
+		guard case .hornClause(_, let body, _) = generalFirst.canonicalize() else { return }
 		#expect(body.count == 1, "the surviving rule is the general one: \(body)")
 	}
 }

@@ -14,43 +14,59 @@ extension RBDB {
 	/// `nil` if it should not be stored (a tautology, or already subsumed by a stored rule). Facts are
 	/// returned unchanged.
 	func canonicalizeRuleForAssert(_ formula: Formula) throws -> Formula? {
-		guard case .hornClause(let head, let body) = formula.canonicalize(), !body.isEmpty else {
+		guard case .hornClause(let head, let body, let guards) = formula.canonicalize(),
+			!body.isEmpty || !guards.isEmpty
+		else {
 			return formula  // a fact — no rule-level canonicalization applies
 		}
 
-		// 1. Intra-rule literal dedup: `p(X) :- q(X), q(X)` ⟹ `p(X) :- q(X)`.
+		// 1. Intra-rule literal dedup: `p(X) :- q(X), q(X)` ⟹ `p(X) :- q(X)`. Canonicalization has
+		//    sorted (but not deduped) both lists, so a repeated guard collapses the same way.
 		var dedupedBody: [Predicate] = []
 		for literal in body where !dedupedBody.contains(literal) { dedupedBody.append(literal) }
+		var dedupedGuards: [BooleanExpression] = []
+		for g in guards where !dedupedGuards.contains(g) { dedupedGuards.append(g) }
 
 		// 2. Tautology drop: a head identical to one of its body literals derives nothing new.
 		if dedupedBody.contains(head) { return nil }
 
-		// 3. Subsumption. A rule with the same head and a *strictly smaller* body is more general (fewer
-		//    constraints ⟹ derives a superset), so it subsumes the one with the larger body. Compare the
-		//    incoming rule against every stored rule for this head, in both directions.
+		// 3. Subsumption. A rule with the same head and a *strictly smaller* body — fewer positive
+		//    literals and/or fewer guards — is more general (weaker constraints ⟹ derives a superset),
+		//    so it subsumes the one with the larger body. Compare in both directions.
+		let incoming = (dedupedBody, dedupedGuards)
 		var toDelete: [Formula] = []
 		for stored in try fetchRules(for: head.name) {
-			guard case .hornClause(let storedHead, let storedBody) = stored.canonicalize(),
-				storedHead == head
+			guard
+				case .hornClause(let storedHead, let storedBody, let storedGuards) =
+					stored.canonicalize(), storedHead == head
 			else { continue }
+			let existing = (storedBody, storedGuards)
 			// A stored rule strictly more general than the incoming one ⟹ incoming is redundant.
-			if bodySubsumes(storedBody, dedupedBody) { return nil }
+			if bodySubsumes(existing, incoming) { return nil }
 			// The incoming rule strictly more general than a stored one ⟹ that stored rule is redundant.
-			if bodySubsumes(dedupedBody, storedBody) { toDelete.append(stored) }
+			if bodySubsumes(incoming, existing) { toDelete.append(stored) }
 		}
 		for rule in toDelete {
 			let json = try formulaToJSON(rule)
 			try super.query(sql: "DELETE FROM _rule WHERE formula = jsonb(\(json))")
 		}
 
-		return .hornClause(positive: head, negative: dedupedBody)
+		return .hornClause(positive: head, negative: dedupedBody, guards: dedupedGuards)
 	}
 
-	/// Whether body `general` strictly subsumes body `specific`: every literal of `general` also
-	/// appears in `specific`, and `specific` has at least one literal `general` lacks (proper subset,
-	/// treating each as a set). Both share the same canonical variable names, so `==` on literals is a
-	/// sound comparison. Fewer body literals ⟹ weaker guard ⟹ more general rule.
-	private func bodySubsumes(_ general: [Predicate], _ specific: [Predicate]) -> Bool {
-		general.allSatisfy { specific.contains($0) } && specific.contains { !general.contains($0) }
+	/// Whether body `general` strictly subsumes body `specific`: every literal *and* guard of `general`
+	/// also appears in `specific`, and `specific` has at least one literal or guard `general` lacks
+	/// (proper subset, treating each as a set). Both share the same canonical variable names, so `==`
+	/// is a sound comparison. Fewer constraints ⟹ more general rule.
+	private func bodySubsumes(
+		_ general: ([Predicate], [BooleanExpression]),
+		_ specific: ([Predicate], [BooleanExpression])
+	) -> Bool {
+		let literalsSubset = general.0.allSatisfy { specific.0.contains($0) }
+		let guardsSubset = general.1.allSatisfy { specific.1.contains($0) }
+		let proper =
+			specific.0.contains { !general.0.contains($0) }
+			|| specific.1.contains { !general.1.contains($0) }
+		return literalsSubset && guardsSubset && proper
 	}
 }

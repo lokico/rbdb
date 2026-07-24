@@ -11,19 +11,17 @@ import Foundation
 /// the only way to *build* an expression is through the normalizing factories on `Term`
 /// (`Term.sum`, `Term.product`, `Term.power`, …). There is deliberately no subtract or divide
 /// case — they lower to add/multiply/exponent.
-public struct ArithmeticExpression: Comparable, CustomDebugStringConvertible {
-	package enum Raw: Comparable {
-		case add(Term, Term)
-		case multiply(Term, Term)
-		case exponent(Term, Term)
-	}
-
+public struct ArithmeticExpression: ExpressionInternal {
 	public enum Op: String, CodingKey {
 		case add = "+"
 		case multiply = "*"
 		case exponent = "^"
 	}
-
+	package enum Raw: Comparable {
+		case add(Term, Term)
+		case multiply(Term, Term)
+		case exponent(Term, Term)
+	}
 	package var raw: Raw
 
 	public var operation: Op {
@@ -44,29 +42,24 @@ public struct ArithmeticExpression: Comparable, CustomDebugStringConvertible {
 		}
 	}
 
-	public var debugDescription: String {
-		let operands = self.operands
-		if operands.count == 2 {
-			return "\(operands[0]) \(operation.rawValue) \(operands[1])"
-		} else {
-			return "\(operation)(\(operands.map(\.debugDescription).joined(separator: ", ")))"
-		}
-	}
-
 	package init(_ raw: Raw) {
 		self.raw = raw
 	}
 
-	// Not public because it's possible to create a non-canonical expression, e.g. ArithmeticExpression(.add, .number(1), .number(2))
-	package init(_ op: Op, _ t1: Term, _ t2: Term) {
-		switch op {
-		case .add: self.raw = .add(t1, t2)
-		case .multiply: self.raw = .multiply(t1, t2)
-		case .exponent: self.raw = .exponent(t1, t2)
-		}
+	// Not public because it's possible to create a non-canonical expression, e.g.
+	//  ArithmeticExpression(operation: .add, lhs: .number(1), rhs: .number(2))
+	package init(operation: Op, lhs: Term, rhs: Term) {
+		self.raw =
+			switch operation {
+			case .add: .add(lhs, rhs)
+			case .multiply: .multiply(lhs, rhs)
+			case .exponent: .exponent(lhs, rhs)
+			}
 	}
 
 	// Comparable is never synthesized for a struct, so forward to the synthesized ordering on `raw`.
+	//  This deliberately overrides `Expression`'s default ordering (by operator symbol): the case order
+	//  here is baked into every stored canonical form, so it must not drift.
 	public static func == (lhs: ArithmeticExpression, rhs: ArithmeticExpression) -> Bool {
 		lhs.raw == rhs.raw
 	}
@@ -75,40 +68,12 @@ public struct ArithmeticExpression: Comparable, CustomDebugStringConvertible {
 	}
 }
 
-extension ArithmeticExpression: Codable {
-	public init(from decoder: Decoder) throws {
-		let c = try decoder.container(keyedBy: Op.self)
-		guard let op = c.allKeys.last else {
-			throw DecodingError.dataCorrupted(
-				DecodingError.Context(
-					codingPath: decoder.codingPath,
-					debugDescription: "No valid ArithmeticExpression operation key found"
-				)
-			)
-		}
-
-		let operands = try c.decode([Term].self, forKey: op)
-		guard operands.count == 2 else {
-			throw DecodingError.dataCorrupted(
-				DecodingError.Context(
-					codingPath: decoder.codingPath,
-					debugDescription: "Invalid expression"
-				)
-			)
-		}
-		self = .init(op, operands[0], operands[1])
-	}
-	public func encode(to encoder: Encoder) throws {
-		var c = encoder.container(keyedBy: Op.self)
-		try c.encode(operands, forKey: operation)
-	}
-}
-
 extension Formula {
-	/// Returns `true` if this `Formula` contains any arithmetic (`.arithmetic`) anywhere it its head *or* body.
+	/// Returns `true` if this `Formula` contains any arithmetic (`.arithmetic`) in a head *or* body literal.
+	/// Guards are deliberately not considered: a guard only filters rows, so arithmetic there can't invent values.
 	public var doesArithmetic: Bool {
 		switch self {
-		case .hornClause(let head, let bodies):
+		case .hornClause(let head, let bodies, _):
 			func any(_ predicate: Predicate) -> Bool {
 				predicate.arguments.contains {
 					if case .arithmetic = $0 { return true } else { return false }
@@ -292,7 +257,7 @@ private func splitPower(_ term: Term) -> (Term, Term) {
 private func nest(_ sorted: [Term], _ op: ArithmeticExpression.Op) -> Term {
 	var accumulator = sorted[sorted.count - 1]
 	for term in sorted[..<(sorted.count - 1)].reversed() {
-		accumulator = .arithmetic(ArithmeticExpression(op, term, accumulator))
+		accumulator = .arithmetic(ArithmeticExpression(operation: op, lhs: term, rhs: accumulator))
 	}
 	return accumulator
 }

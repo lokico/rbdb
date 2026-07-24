@@ -15,7 +15,7 @@ extension RBDB {
 		while let name = stack.popLast() {
 			guard cone.insert(name).inserted else { continue }
 			for rule in try fetchRules(for: name) {
-				guard case .hornClause(_, let bodies) = rule else { continue }
+				guard case .hornClause(_, let bodies, _) = rule else { continue }
 				for body in bodies { stack.append(body.name) }
 			}
 		}

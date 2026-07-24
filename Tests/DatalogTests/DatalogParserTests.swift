@@ -277,3 +277,65 @@ func parseFactsWithSingleQuotedStrings() throws {
 	)
 	#expect(result3 == expected3)
 }
+
+@Test("Parse a rule with a comparison guard")
+func parseComparisonGuard() throws {
+	let parser = DatalogParser()
+
+	// brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S
+	let result = try parser.parse(
+		"brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S")
+
+	let B = Var()
+	let S = Var()
+	let X = Var()
+	let expected = Formula.hornClause(
+		positive: Predicate(name: "brother", arguments: [.variable(B), .variable(S)]),
+		negative: [
+			Predicate(name: "male", arguments: [.variable(B)]),
+			Predicate(name: "parent", arguments: [.variable(X), .variable(B)]),
+			Predicate(name: "parent", arguments: [.variable(X), .variable(S)]),
+		],
+		guards: [.notEqual(.variable(B), .variable(S))]
+	)
+	#expect(result.canonicalize() == expected.canonicalize())
+}
+
+@Test("Comparison operators parse to their canonical BooleanExpression")
+func parseComparisonOperators() throws {
+	let parser = DatalogParser()
+
+	func guardOf(_ source: String) throws -> BooleanExpression? {
+		guard case .hornClause(_, _, let guards) = try parser.parse(source) else { return nil }
+		return guards.first
+	}
+
+	// `>` / `>=` fold to `<` / `<=` with swapped operands; `=` / `!=` sort operands.
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X < Y")?.operation == .lt)
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X <= Y")?.operation == .le)
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X > Y")?.operation == .lt)  // folded
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X >= Y")?.operation == .le)  // folded
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X = Y")?.operation == .eq)
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X != Y")?.operation == .ne)
+
+	// `X > Y` and `Y < X` produce the identical canonical guard.
+	#expect(try guardOf("q(X, Y) :- p(X, Y), X > Y") == guardOf("q(X, Y) :- p(X, Y), Y < X"))
+}
+
+@Test("Comparison guards round-trip through printing")
+func comparisonGuardRoundTrip() throws {
+	let parser = DatalogParser()
+	for source in [
+		"q(X, Y) :- p(X, Y), X < Y",
+		"q(X, Y) :- p(X, Y), X <= Y",
+		"q(X, Y) :- p(X, Y), X = Y",
+		"q(X, Y) :- p(X, Y), X != Y",
+		"brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S",
+		"r(X, Y) :- p(X, Y), X + 1 < Y",
+	] {
+		let parsed = try parser.parse(source)
+		let printed = try parser.print(parsed)
+		let reparsed = try parser.parse(printed)
+		#expect(parsed == reparsed, "round-trip failed for \(source) (printed: \(printed))")
+	}
+}

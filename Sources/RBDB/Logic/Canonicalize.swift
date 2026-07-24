@@ -6,10 +6,14 @@ class CanonicalizeRewriter: VariableMappingRewriter, SymbolRewriter {
 
 	func rewrite(formula: Formula) -> Formula {
 		switch formula {
-		case .hornClause(positive: let positive, negative: let negatives):
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
+			// Guards are rebuilt through `mappingOperands` so the symmetric operators re-sort under the
+			//  renamed variables (like the arithmetic factories re-sort operands), then sorted as a group
+			//  after the positive literals for an order-independent canonical form.
 			.hornClause(
 				positive: rewrite(predicate: positive),
-				negative: negatives.map(rewrite(predicate:)).sorted())
+				negative: negatives.map(rewrite(predicate:)).sorted(),
+				guards: guards.map { $0.mappingOperands(rewrite(term:)) }.sorted())
 		}
 	}
 

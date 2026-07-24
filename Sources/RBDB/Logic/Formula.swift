@@ -1,13 +1,19 @@
 public enum Formula: Symbol {
-	case hornClause(positive: Predicate, negative: [Predicate])
+	case hornClause(positive: Predicate, negative: [Predicate], guards: [BooleanExpression])
+
+	/// Convenience for the common guard-free clause; keeps the many existing `positive:negative:`
+	/// construction sites working unchanged (pattern matches must still bind all three payloads).
+	public static func hornClause(positive: Predicate, negative: [Predicate]) -> Formula {
+		.hornClause(positive: positive, negative: negative, guards: [])
+	}
 
 	public static func predicate(_ predicate: Predicate) -> Formula {
-		.hornClause(positive: predicate, negative: [])
+		.hornClause(positive: predicate, negative: [], guards: [])
 	}
 
 	public var type: SymbolType {
 		switch self {
-		case .hornClause(positive: let positive, negative: _):
+		case .hornClause(positive: let positive, negative: _, guards: _):
 			.hornClause(positiveName: positive.name)
 		}
 	}
@@ -21,9 +27,9 @@ public enum Formula: Symbol {
 		try reducer.reduce(initialResult, self)
 	}
 
-	public func isRecursive<T: StringProtocol>(for predicateName: T) -> Bool {
+	public func isRecursive(for predicateName: String) -> Bool {
 		switch self {
-		case .hornClause(positive: _, negative: let negatives):
+		case .hornClause(positive: _, negative: let negatives, guards: _):
 			return negatives.contains { $0.name == predicateName }
 		}
 	}
@@ -32,10 +38,11 @@ public enum Formula: Symbol {
 extension SymbolRewriter {
 	public func rewrite(formula: Formula) -> Formula {
 		switch formula {
-		case .hornClause(positive: let positive, negative: let negatives):
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
 			.hornClause(
 				positive: rewrite(predicate: positive),
-				negative: negatives.map(rewrite(predicate:))
+				negative: negatives.map(rewrite(predicate:)),
+				guards: guards.map { $0.mappingOperands(rewrite(term:)) }
 			)
 		}
 	}
@@ -48,8 +55,12 @@ extension SymbolRewriter {
 extension SymbolReducer {
 	public func reduce(_ prev: Result, _ formula: Formula) throws -> Result {
 		switch formula {
-		case .hornClause(positive: let positive, negative: let negatives):
-			try negatives.reduce(reduce(prev, positive), reduce)
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
+			var result = try negatives.reduce(reduce(prev, positive), reduce)
+			for g in guards {
+				result = try reduce(reduce(result, g.lhs), g.rhs)
+			}
+			return result
 		}
 	}
 
@@ -67,10 +78,16 @@ extension Formula: Codable {
 		case .hornClause(let positiveName):
 			let positive = Predicate(name: positiveName, arguments: try arr.decode([Term].self))
 			var negatives: [Predicate] = []
+			var guards: [BooleanExpression] = []
+			// Body entries are heterogeneous: a predicate is an unkeyed array, a guard the keyed
+			//  object `{op: [lhs, rhs]}`. `BodyEntry` tells them apart by container shape.
 			while !arr.isAtEnd {
-				negatives.append(try arr.decode(Predicate.self))
+				switch try arr.decode(BodyEntry.self) {
+				case .predicate(let p): negatives.append(p)
+				case .guard(let g): guards.append(g)
+				}
 			}
-			self = .hornClause(positive: positive, negative: negatives)
+			self = .hornClause(positive: positive, negative: negatives, guards: guards)
 		default:
 			throw DecodingError.dataCorrupted(
 				DecodingError.Context(
@@ -85,11 +102,33 @@ extension Formula: Codable {
 		var arr = encoder.unkeyedContainer()
 		try arr.encode(type)
 		switch self {
-		case .hornClause(positive: let positive, negative: let negatives):
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
 			try arr.encode(positive.arguments)
 			for negative in negatives {
 				try arr.encode(negative)
 			}
+			for g in guards {
+				try arr.encode(g)
+			}
+		}
+	}
+}
+
+/// A single body entry when decoding a formula: a positive literal (unkeyed array) or a comparison
+/// guard (keyed object). The two use disjoint JSON container kinds, so the container itself decides
+/// which this is — and once an entry is known to be a guard, its own decoding error is reported
+/// rather than the confusing one from a fallthrough to the predicate decoder.
+private enum BodyEntry: Decodable {
+	case predicate(Predicate)
+	case `guard`(BooleanExpression)
+
+	init(from decoder: Decoder) throws {
+		if let container = try? decoder.container(keyedBy: BooleanExpression.Op.self),
+			!container.allKeys.isEmpty
+		{
+			self = .guard(try BooleanExpression(from: decoder))
+		} else {
+			self = .predicate(try Predicate(from: decoder))
 		}
 	}
 }

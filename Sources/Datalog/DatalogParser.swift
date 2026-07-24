@@ -33,9 +33,8 @@ public struct DatalogParser: ParserPrinter {
 
 extension DatalogParser {
 	private var hornClauseParser: some ParserPrinter<Substring, Formula> {
-		// FIXME: Swift really want a type annotation for this
-		let emptyPredicates: [Predicate] = []
-		return ParsePrint(.case(Formula.hornClause)) {
+		let emptyBody: [BodyItem] = []
+		return ParsePrint(HornClauseConversion()) {
 			// Head
 			predicateParser
 
@@ -45,18 +44,60 @@ extension DatalogParser {
 				":-".printing(" :- ")
 				Whitespace()
 				Many {
-					predicateParser
+					bodyItemParser
 					Whitespace()
 				} separator: {
 					","
 					Whitespace().printing(" ".utf8)
 				}
-			}.map(.orDefault(emptyPredicates))
+			}.map(.orDefault(emptyBody))
 
 			// Optional period at the end
 			".".replaceError(with: ())
 		}
 	}
+
+	// A body item is either a positive literal or a comparison guard. Predicate is tried first (the
+	//  common case); it fails fast on a guard because a guard has no `(` after its leading term, so the
+	//  parser backtracks to `comparisonParser`.
+	private var bodyItemParser: some ParserPrinter<Substring, BodyItem> {
+		OneOf {
+			predicateParser.map(.case(BodyItem.predicate))
+			comparisonParser.map(.case(BodyItem.comparison))
+		}
+	}
+}
+
+/// A parsed rule-body element, before it is split into the positive literals and guards a `Formula`
+/// stores separately.
+enum BodyItem: Equatable {
+	case predicate(Predicate)
+	case comparison(BooleanExpression)
+}
+
+/// Assembles a head predicate plus a flat list of body items into a `Formula`, and back. Printing
+/// emits the positive literals first, then the guards — the canonical body order.
+private struct HornClauseConversion: Conversion {
+	func apply(_ input: (Predicate, [BodyItem])) throws -> Formula {
+		var predicates: [Predicate] = []
+		var guards: [BooleanExpression] = []
+		for item in input.1 {
+			switch item {
+			case .predicate(let p): predicates.append(p)
+			case .comparison(let g): guards.append(g)
+			}
+		}
+		return .hornClause(positive: input.0, negative: predicates, guards: guards)
+	}
+
+	func unapply(_ output: Formula) throws -> (Predicate, [BodyItem]) {
+		guard case .hornClause(let head, let negatives, let guards) = output else {
+			throw ConversionError()
+		}
+		return (head, negatives.map(BodyItem.predicate) + guards.map(BodyItem.comparison))
+	}
+
+	private struct ConversionError: Error {}
 }
 
 // MARK: - Predicate Parser
@@ -82,6 +123,64 @@ extension DatalogParser {
 
 			")"
 		}
+	}
+}
+
+// MARK: - Comparison Guard Parser
+
+extension DatalogParser {
+	// A comparison guard: `term op term`, e.g. `B != S` or `T + 1 < 10`.
+	private var comparisonParser: some ParserPrinter<Substring, BooleanExpression> {
+		ParsePrint(ComparisonFold()) {
+			termParser
+			Whitespace().printing(" ".utf8)
+			comparisonOpParser
+			Whitespace().printing(" ".utf8)
+			termParser
+		}
+	}
+
+	// Longer operators first, so `<=`/`>=`/`!=` aren't mis-read as `<`/`>`/`=`.
+	private var comparisonOpParser: some ParserPrinter<Substring, CompareOp> {
+		OneOf {
+			"<=".map { .le }
+			">=".map { .ge }
+			"!=".map { .ne }
+			"<".map { .lt }
+			">".map { .gt }
+			"=".map { .eq }
+		}
+	}
+}
+
+// The surface comparison operators, including the order-reversed `>`/`>=` that `BooleanExpression`
+//  itself doesn't store (it folds them to `<`/`<=`).
+private enum CompareOp { case lt, le, gt, ge, eq, ne }
+
+/// Builds a canonical `BooleanExpression` from a parsed `lhs op rhs`, routing each operator through
+/// the normalizing factory; prints a canonical comparison back (its op is always one of `<`/`<=`/`=`/`!=`).
+private struct ComparisonFold: Conversion {
+	func apply(_ input: (Term, CompareOp, Term)) throws -> BooleanExpression {
+		let (lhs, op, rhs) = input
+		switch op {
+		case .lt: return .lessThan(lhs, rhs)
+		case .le: return .lessThanOrEqual(lhs, rhs)
+		case .gt: return .greaterThan(lhs, rhs)
+		case .ge: return .greaterThanOrEqual(lhs, rhs)
+		case .eq: return .equal(lhs, rhs)
+		case .ne: return .notEqual(lhs, rhs)
+		}
+	}
+
+	func unapply(_ output: BooleanExpression) throws -> (Term, CompareOp, Term) {
+		let op: CompareOp
+		switch output.operation {
+		case .lt: op = .lt
+		case .le: op = .le
+		case .eq: op = .eq
+		case .ne: op = .ne
+		}
+		return (output.lhs, op, output.rhs)
 	}
 }
 
@@ -234,12 +333,6 @@ extension Conversion {
 	where Self == Conversions.OrDefault<T> {
 		return .init(defaultValue: defaultValue)
 	}
-
-	@inlinable
-	public static func leftAssociate<T, C: Conversion<(T, T), T>>(_ combine: C) -> Self
-	where Self == Conversions.LeftAssociate<T, C> {
-		return .init(combine: combine)
-	}
 }
 
 extension Conversions {
@@ -259,40 +352,6 @@ extension Conversions {
 		@inlinable
 		public func unapply(_ output: T) -> T? {
 			return output == defaultValue ? nil : output
-		}
-	}
-
-	public struct LeftAssociate<T, C: Conversion<(T, T), T>>: Conversion {
-		public let combine: C
-
-		@inlinable
-		public init(combine: C) {
-			self.combine = combine
-		}
-
-		@inlinable
-		public func apply(_ input: (T, [T])) throws -> T {
-			var lhs = input.0
-			for rhs in input.1 {
-				lhs = try combine.apply((lhs, rhs))
-			}
-			return lhs
-		}
-
-		@inlinable
-		public func unapply(_ output: T) throws -> (T, [T]) {
-			guard let initial = try? combine.unapply(output) else {
-				return (output, [])
-			}
-			var fst = initial.0
-			var arr = [initial.1]
-
-			while let (newFst, snd) = try? combine.unapply(fst) {
-				fst = newFst
-				arr.prepend(snd)
-			}
-
-			return (fst, arr)
 		}
 	}
 }

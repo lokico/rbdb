@@ -16,7 +16,7 @@ extension RBDB {
 		defer { visiting.remove(name) }
 		for rule in try fetchRules(for: name) {
 			if rule.isRecursive(for: name) { return true }
-			if case .hornClause(_, let negatives) = rule {
+			if case .hornClause(_, let negatives, _) = rule {
 				for body in negatives where try involvesRecursion(body.name, &visiting) {
 					return true
 				}
@@ -58,7 +58,7 @@ extension RBDB {
 			}
 			guard threaded.insert(name).inserted else { return }
 			for rule in rules {
-				guard case .hornClause(let head, let negatives) = rule else { continue }
+				guard case .hornClause(let head, let negatives, _) = rule else { continue }
 				for body in negatives where try involvesRecursion(body.name) {
 					guard let bodyColumns = try getColumns(for: body.name) else { continue }
 					let propagated = propagateConstraints(
@@ -139,9 +139,8 @@ extension RBDB {
 						constraints: recursiveConstraints[name] ?? [:])
 				{
 					// SQLite forbids referencing a recursive CTE from inside a subquery, so we can't
-					//  wrap the rule SQL — inject the bound conditions directly. The rule SQL never
-					//  contains a WHERE today (RuleIntoSQLReducer only puts conditions on JOIN ON
-					//  clauses), but be defensive in case that changes.
+					//  wrap the rule SQL — inject the bound conditions directly, extending the rule's
+					//  own WHERE clause (constants on its first literal, and any guards) when it has one.
 					let connector =
 						ruleSQL.range(of: " WHERE ", options: .caseInsensitive) != nil
 						? " AND " : " WHERE "
@@ -278,7 +277,7 @@ extension RBDB {
 		constraints: [String: String]
 	) -> [String]? {
 		guard !constraints.isEmpty,
-			case .hornClause(let head, let bodies) = rule,
+			case .hornClause(let head, let bodies, _) = rule,
 			let recursiveBody = bodies.first(where: { $0.name == predicateName })
 		else { return nil }
 
