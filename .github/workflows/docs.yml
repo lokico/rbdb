@@ -24,6 +24,8 @@ jobs:
         --allow-writing-to-directory "$OUT_DIR" \
         generate-documentation \
         --target RBDB \
+        --target Datalog \
+        --enable-experimental-combined-documentation \
         --disable-indexing \
         --transform-for-static-hosting \
         --hosting-base-path "${{ steps.pages.outputs.base_path }}" \

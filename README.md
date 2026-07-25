@@ -204,6 +204,26 @@ swift build
 swift test
 ```
 
+### Documentation
+
+Documentation lives in DocC catalogs alongside the sources (`Sources/RBDB/RBDB.docc`), and is published to GitHub Pages on every push to `main`. The published site is a combined archive covering both the `RBDB` and `Datalog` modules, with a landing page linking each.
+
+To build and preview the same thing locally:
+
+```bash
+./Scripts/preview-docs.sh
+```
+
+That serves at <http://localhost:8080/documentation/>. Since DocC can only preview one target at a time, use `--live` for a server that rebuilds as you edit a single module:
+
+```bash
+./Scripts/preview-docs.sh --live --target RBDB
+```
+
+Pass `--port` to serve elsewhere; `--help` lists all options.
+
+To add a guide or conceptual article, drop a Markdown file in `Sources/RBDB/RBDB.docc` and curate it under a `## Topics` section in `RBDB.md`.
+
 ### Code Formatting
 
 The project uses `swift-format` for consistent code style. Run this to format all source files:
