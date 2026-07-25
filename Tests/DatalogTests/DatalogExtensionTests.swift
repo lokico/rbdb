@@ -200,11 +200,10 @@ struct DatalogExtensionTests {
 		try db.query(sql: "CREATE TABLE d(x)")
 
 		// The same rule written with commuted `+` operands canonicalizes identically, so the
-		//  second assertion collides with the first on the `_rule.formula` UNIQUE constraint.
+		//  second assertion collides with the first on the `_rule.formula` UNIQUE constraint, which
+		//  is silently ignored rather than thrown.
 		try db.assert(datalog: "d(X + 1) :- b(X)")
-		#expect(throws: (any Error).self) {
-			try db.assert(datalog: "d(1 + X) :- b(X)")
-		}
+		try db.assert(datalog: "d(1 + X) :- b(X)")
 
 		let rows = Array(try db.query(sql: "SELECT COUNT(*) AS c FROM _rule"))
 		#expect(rows.first?["c"] as? Int64 == 1, "commuted rules should store as one row")

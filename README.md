@@ -1,6 +1,6 @@
 # RBDB
 
-A relational database built on top of SQLite with integrated Datalog capabilities.
+A hybrid SQL/Datalog relational database built on top of SQLite.
 
 ## Installation
 
@@ -12,7 +12,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/chkn/rbdb.git", revision: "COMMIT_HASH_HERE")
+    .package(url: "https://github.com/lokico/rbdb", revision: "COMMIT_HASH_HERE")
 ]
 ```
 ### SQLite Dependency
@@ -21,95 +21,21 @@ RBDB requires SQLite 3.45.0 or newer built with `SQLITE_ENABLE_MATH_FUNCTIONS` (
 
 ## Usage
 
-### Create database and define a predicate
-
-```swift
-import RBDB
-
-let db = try RBDB(path: "database.db")
-
-// Defines a `user` predicate
-try db.query(sql: "CREATE TABLE user(name)")
-```
-
-### Assert facts
-
-You can assert simple facts in these equivalent ways:
-
-```swift
-// 1. Create Formula directly
-let formula1 = Formula.predicate(Predicate(name: "user", arguments: [.string("Alice")]))
-try db.assert(formula: formula1)
-
-// 2. Parse datalog into Formula manually
-import Datalog
-let formula2 = try DatalogParser().parse("user('Alice')")
-assert(formula1 == formula2)  // true
-try db.assert(formula: formula2) // fails if formula1 was already asserted
-
-// 3. Datalog convenience extension (requires `import Datalog`)
-try db.assert(datalog: "user('Alice')") // fails if already asserted above
-
-// 4. SQL INSERT
-try db.query(sql: "INSERT INTO user(name) VALUES ('Alice')") // fails if either formula above was already asserted
-```
-
-All approaches above are equivalent ways of asserting the same fact. As noted in the code comments, you can only assert a fact once. Subsequent attempts to assert an equivalent fact will trigger a unique constraint failure in the database.
-
-### Rules
-
-RBDB supports logical rules restricted to safe Horn clauses. A safe Horn clause has at most one positive literal (the head) and all variables in the head must appear in at least one positive literal in the body.
-
-Here's a simple example showing how to define rules and query them:
-
-```swift
-import RBDB
-import Datalog
-
-let db = try RBDB(path: "family.db")
-
-// Create tables for our predicates
-try db.query(sql: "CREATE TABLE parent(parent, child)")
-try db.query(sql: "CREATE TABLE grandparent(grandparent, grandchild)")
-
-// Assert some facts using datalog syntax
-try db.assert(datalog: "parent('John', 'Mary')")
-try db.assert(datalog: "parent('Mary', 'Tom')")
-try db.assert(datalog: "parent('Bob', 'Alice')")
-
-// Define a rule: X is the grandparent of Z if X is the parent of Y and Y is the parent of Z
-try db.assert(datalog: "grandparent(X, Z) :- parent(X, Y), parent(Y, Z)")
-
-// Query back using SQL
-let result = try db.query(sql: "SELECT * FROM grandparent")
-// grandchild | grandparent
-// -----------+------------
-// Tom        | John
-```
-
-### Canonicalize logically equivalent formulas
-
-```swift
-let x = Var()
-let y = Var()
-let f1 = Formula.predicate(Predicate(name: "User", arguments: [.variable(x)]))
-let f2 = Formula.predicate(Predicate(name: "User", arguments: [.variable(y)]))
-assert(f1.canonicalize() == f2.canonicalize())  // true
-```
+See the [Getting Started](https://lokico.github.io/rbdb/documentation/rbdb/gettingstarted) guide for a quick overview of the Swift API.
 
 ### Interactive CLI Tool
 
-The included `rbdb` command provides an interactive console that supports both SQL and datalog modes. Use Shift+Tab to switch between modes:
+The included `rbdb1` command provides an interactive console that supports both SQL and datalog modes. Use Shift+Tab to switch between modes:
 
 ```bash
 # Interactive mode
-swift run rbdb database.db
+swift run rbdb1 database.db
 
 # Execute file
-swift run rbdb -f script.sql database.db
+swift run rbdb1 -f script.sql database.db
 
 # In-memory database
-swift run rbdb
+swift run rbdb1
 ```
 
 Example session:

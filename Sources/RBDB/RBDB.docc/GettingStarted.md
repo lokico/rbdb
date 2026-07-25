@@ -13,32 +13,39 @@ let db = try RBDB(path: "family.db")
 
 try db.query(sql: "CREATE TABLE parent(parent, child)")
 try db.query(sql: "CREATE TABLE grandparent(grandparent, grandchild)")
+try db.query(sql: "CREATE TABLE sibling(s1, s2)")
 ```
 
 ## Asserting facts
 
-Facts are ``Formula`` values. You can build one directly, or — with the `Datalog` module —
-parse it from datalog syntax:
+Facts are ``Formula`` values. You can build them directly, but usually, you'll just use SQL or Datalog syntax:
 
 ```swift
-import Datalog
+try db.query(sql: "INSERT INTO parent VALUES ('John', 'Mary'), ('John', 'Sally')")
 
-try db.assert(datalog: "parent('John', 'Mary')")
+import Datalog
 try db.assert(datalog: "parent('Mary', 'Tom')")
 ```
 
-A plain SQL `INSERT` asserts the same fact. Whichever form you use, a given fact can only be
-asserted once: asserting an equivalent fact again raises a unique constraint failure, because
-formulas are canonicalized before they are stored.
+Both are equivalent ways of asserting facts. Whichever form you use, formulas are canonicalized before they are stored, and asserting an equivalent fact again, using either syntax, is a no-op.
 
 ## Adding rules
 
-Rules are asserted the same way facts are, and are restricted to safe Horn clauses — at most one
-positive literal in the head, with every head variable appearing in a positive literal of the body:
+RBDB supports logical rules restricted to safe Horn clauses with guard conditions. A safe Horn clause has at most one positive literal in the head, and all variables in the head must appear in at least one positive literal in the body.
+
+Rules can only be asserted in Datalog syntax:
 
 ```swift
 try db.assert(datalog: "grandparent(X, Z) :- parent(X, Y), parent(Y, Z)")
 ```
+
+Rules can also have boolean guard conditions:
+
+```swift
+try db.assert(datalog: "sibling(X, Y) :- parent(P, X), parent(P, Y), X != Y")
+```
+
+## Querying
 
 Querying a predicate returns asserted facts along with everything the rules derive:
 
@@ -47,6 +54,16 @@ let result = try db.query(sql: "SELECT * FROM grandparent")
 // grandchild | grandparent
 // -----------+------------
 // Tom        | John
+```
+
+You can also query using Datalog syntax:
+
+```swift
+let result = try db.query(datalog: "sibling(X, Y)")
+// X     | Y
+// ------+------
+// Mary  | Sally
+// Sally | Mary
 ```
 
 ## Next steps

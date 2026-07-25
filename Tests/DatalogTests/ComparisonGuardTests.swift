@@ -202,11 +202,10 @@ struct ComparisonGuardTests {
 		try db.query(sql: "CREATE TABLE q(a, b)")
 
 		// `X < Y` and `Y > X` are the same comparison; the second assertion collides with the first
-		//  on the `_rule.formula` UNIQUE constraint (both fold to the identical canonical guard).
+		//  on the `_rule.formula` UNIQUE constraint (both fold to the identical canonical guard), which
+		//  is silently ignored rather than thrown.
 		try db.assert(datalog: "q(X, Y) :- p(X, Y), X < Y")
-		#expect(throws: (any Error).self) {
-			try db.assert(datalog: "q(X, Y) :- p(X, Y), Y > X")
-		}
+		try db.assert(datalog: "q(X, Y) :- p(X, Y), Y > X")
 		let rows = Array(
 			try db.query(sql: "SELECT COUNT(*) AS c FROM _rule WHERE output_type='@q'"))
 		#expect(rows.first?["c"] as? Int64 == 1, "commuted guards store as one rule")

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS _predicate (
 
 CREATE TABLE IF NOT EXISTS _rule (
     internal_entity_id INTEGER PRIMARY KEY REFERENCES _entity,
-    formula BLOB UNIQUE NOT NULL, -- JSONB
+    -- ON CONFLICT IGNORE: re-asserting an already-stored fact or rule is a no-op, not an error.
+    formula BLOB UNIQUE ON CONFLICT IGNORE NOT NULL, -- JSONB
     output_type TEXT GENERATED ALWAYS AS (formula->>0) VIRTUAL COLLATE NOCASE,
     arg1_constant ANY GENERATED ALWAYS AS (json_extract(formula, '$[1][0].""')) VIRTUAL, -- NULL if arg is not a constant
     arg2_constant ANY GENERATED ALWAYS AS (json_extract(formula, '$[1][1].""')) VIRTUAL,  -- NULL if arg is not a constant
