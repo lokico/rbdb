@@ -17,7 +17,7 @@ dependencies: [
 ```
 ### SQLite Dependency
 
-RBDB requires SQLite 3.45.0 or newer built with `SQLITE_ENABLE_MATH_FUNCTIONS` (the default in most builds). The system SQLite on macOS is known to work. Otherwise, you'll need to build SQLite and supply a module map (see Dockerfile for an example).
+RBDB requires SQLite 3.45.0 or newer built with `SQLITE_ENABLE_MATH_FUNCTIONS` (the default in most builds). The system SQLite on macOS is known to work.
 
 ## Usage
 
@@ -177,4 +177,3 @@ swift format -i -r .
 ## License
 
 [MIT](LICENSE)
-

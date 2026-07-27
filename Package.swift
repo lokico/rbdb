@@ -31,6 +31,9 @@ let package = Package(
 		// Targets can depend on other targets in this package and products from dependencies.
 		.target(
 			name: "RBDB",
+			dependencies: [
+				.byName(name: "SQLite3", condition: .when(platforms: [.linux]))
+			],
 			resources: [
 				.embedInCode("schema.sql")
 			]
@@ -40,6 +43,7 @@ let package = Package(
 			dependencies: [
 				"RBDB",
 				.product(name: "Parsing", package: "swift-parsing"),
+				.byName(name: "SQLite3", condition: .when(platforms: [.linux])),
 			]
 		),
 		.executableTarget(
@@ -53,6 +57,10 @@ let package = Package(
 		.testTarget(
 			name: "DatalogTests",
 			dependencies: ["Datalog", "RBDB"]
+		),
+		.systemLibrary(
+			name: "SQLite3",
+			pkgConfig: "sqlite3"
 		),
 	]
 )
