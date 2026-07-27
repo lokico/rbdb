@@ -28,7 +28,7 @@ struct BooleanExpressionCanonicalizationTests {
 	func greaterOrEqualFoldsToLessOrEqual() {
 		#expect(
 			BooleanExpression.greaterThanOrEqual(a, b) == BooleanExpression.lessThanOrEqual(b, a))
-		#expect(BooleanExpression.greaterThanOrEqual(a, b).operation == .le)  // `>=` is never stored
+		#expect(BooleanExpression.greaterThanOrEqual(a, b).operation == .le)
 	}
 
 	// `transitive string` / `transitive lambda`: the symmetric operators ignore operand order.
