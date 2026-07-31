@@ -18,6 +18,26 @@ func formulaToJSON(_ formula: Formula) throws -> String {
 	return jsonStr
 }
 
+/// SQLite scalar function implementing `is_materializing()`: whether a fixpoint build is currently
+/// running on this connection. The materialized predicates' `BEFORE INSERT` triggers use it to leave
+/// the fixpoint's own `INSERT OR IGNORE` alone — diverting those into `_rule` would turn derived rows
+/// into asserted base facts and the loop would never settle.
+///
+/// Registered with the `RBDB` instance as user data, and *without* `SQLITE_DETERMINISTIC`: the value
+/// changes between the statements of a single build, which SQLite would otherwise be free to cache.
+func isMaterializingSQLiteFunction(
+	context: OpaquePointer?,
+	argc: Int32,
+	argv: UnsafeMutablePointer<OpaquePointer?>?
+) {
+	guard let userData = sqlite3_user_data(context) else {
+		sqlite3_result_error(context, "is_materializing: no database handle", -1)
+		return
+	}
+	let rbdb = Unmanaged<RBDB>.fromOpaque(userData).takeUnretainedValue()
+	sqlite3_result_int(context, rbdb.materializingDepth > 0 ? 1 : 0)
+}
+
 /// SQLite scalar function implementing `predicate_formula(name, args…)`, which builds a predicate
 /// formula from its arguments and returns it as canonical JSON (used by the insert triggers).
 func predicateFormulaSQLiteFunction(

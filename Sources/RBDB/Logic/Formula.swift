@@ -1,8 +1,7 @@
 public enum Formula: Symbol {
 	case hornClause(positive: Predicate, negative: [Predicate], guards: [BooleanExpression])
 
-	/// Convenience for the common guard-free clause; keeps the many existing `positive:negative:`
-	/// construction sites working unchanged (pattern matches must still bind all three payloads).
+	/// Convenience for the common guard-free horn clause.
 	public static func hornClause(positive: Predicate, negative: [Predicate]) -> Formula {
 		.hornClause(positive: positive, negative: negative, guards: [])
 	}
@@ -14,7 +13,7 @@ public enum Formula: Symbol {
 	public var type: SymbolType {
 		switch self {
 		case .hornClause(positive: let positive, negative: _, guards: _):
-			.hornClause(positiveName: positive.name)
+			.hornClause(headName: positive.name)
 		}
 	}
 
@@ -75,8 +74,8 @@ extension Formula: Codable {
 		let key = try arr.decode(SymbolType.self)
 
 		switch key {
-		case .hornClause(let positiveName):
-			let positive = Predicate(name: positiveName, arguments: try arr.decode([Term].self))
+		case .hornClause(let name):
+			let positive = Predicate(name: name, arguments: try arr.decode([Term].self))
 			var negatives: [Predicate] = []
 			var guards: [BooleanExpression] = []
 			// Body entries are heterogeneous: a predicate is an unkeyed array, a guard the keyed

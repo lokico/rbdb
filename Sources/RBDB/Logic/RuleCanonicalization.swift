@@ -8,16 +8,30 @@ import Foundation
 // The transforms are restricted to ones sound *independent of what facts may be asserted later*: a
 // base fact for any predicate can appear at any future time, so we do no unfolding/inlining. See
 // PLAN-HYBRID-EVAL.md. Facts (bodyless) need none of this and pass through untouched.
+/// The outcome of assert-time rule canonicalization: the formula to store, plus the already-stored
+/// rules it makes redundant. The redundant ones are *not* acted on here — they are superseded by
+/// `assert` once the incoming rule has a row to point at. See `canonicalizeRuleForAssert`.
+struct CanonicalizedRule {
+	let store: Formula
+	let supersedes: [Formula]
+
+	init(store: Formula, supersedes: [Formula] = []) {
+		self.store = store
+		self.supersedes = supersedes
+	}
+}
+
 extension RBDB {
-	/// Applies the rule-level canonicalization transforms to a formula about to be asserted, deleting
-	/// any stored rules it subsumes (within the caller's transaction). Returns the formula to store, or
-	/// `nil` if it should not be stored (a tautology, or already subsumed by a stored rule). Facts are
-	/// returned unchanged.
-	func canonicalizeRuleForAssert(_ formula: Formula) throws -> Formula? {
+	/// Applies the rule-level canonicalization transforms to a formula about to be asserted. Returns the
+	/// formula to store together with the stored rules it subsumes, or `nil` if nothing should be stored
+	/// (a tautology, or an incoming rule already subsumed by a stored one — in which case there is
+	/// nothing to supersede either). Facts are returned unchanged.
+	func canonicalizeRuleForAssert(_ formula: Formula) throws -> CanonicalizedRule? {
 		guard case .hornClause(let head, let body, let guards) = formula.canonicalize(),
 			!body.isEmpty || !guards.isEmpty
 		else {
-			return formula  // a fact — no rule-level canonicalization applies
+			// A fact — no rule-level canonicalization applies.
+			return CanonicalizedRule(store: formula)
 		}
 
 		// 1. Intra-rule literal dedup: `p(X) :- q(X), q(X)` ⟹ `p(X) :- q(X)`. Canonicalization has
@@ -34,7 +48,7 @@ extension RBDB {
 		//    literals and/or fewer guards — is more general (weaker constraints ⟹ derives a superset),
 		//    so it subsumes the one with the larger body. Compare in both directions.
 		let incoming = (dedupedBody, dedupedGuards)
-		var toDelete: [Formula] = []
+		var subsumed: [Formula] = []
 		for stored in try fetchRules(for: head.name) {
 			guard
 				case .hornClause(let storedHead, let storedBody, let storedGuards) =
@@ -44,14 +58,12 @@ extension RBDB {
 			// A stored rule strictly more general than the incoming one ⟹ incoming is redundant.
 			if bodySubsumes(existing, incoming) { return nil }
 			// The incoming rule strictly more general than a stored one ⟹ that stored rule is redundant.
-			if bodySubsumes(incoming, existing) { toDelete.append(stored) }
-		}
-		for rule in toDelete {
-			let json = try formulaToJSON(rule)
-			try super.query(sql: "DELETE FROM _rule WHERE formula = jsonb(\(json))")
+			if bodySubsumes(incoming, existing) { subsumed.append(stored) }
 		}
 
-		return .hornClause(positive: head, negative: dedupedBody, guards: dedupedGuards)
+		return CanonicalizedRule(
+			store: .hornClause(positive: head, negative: dedupedBody, guards: dedupedGuards),
+			supersedes: subsumed)
 	}
 
 	/// Whether body `general` strictly subsumes body `specific`: every literal *and* guard of `general`

@@ -397,20 +397,26 @@ That is a feature — an open world has no ambient active domain to quantify ove
 syntax forces you to say what you are closing over, which is the content of the
 assumption.
 
-The `not q(X, Y)` literal is **required, not incidental**, and for a second reason beyond
-range restriction: PLAN-RETRACTION §4.2.1 permits a negative head `-q(t̄)` only when the body
-contains the matching `not q(t̄)`. Together with this phase's **stratification check** (§2.2)
-that yields a real guarantee — when `-q(ā)` is derived, `not q(ā)` held, so `q(ā)` was not
-derivable, and `q` cannot depend back on `-q` without closing a cycle through negation that
-stratification rejects. So `q(ā)` and `-q(ā)` are never both derivable, and the assert-time
-coherence check (PLAN-RETRACTION §4.2, which refuses contradictory ground facts rather than
-repairing them) has nothing left to catch on the rule side.
+The `not q(X, Y)` literal is **required** by the range restriction, and that is now the only
+thing requiring it. An earlier version of this paragraph gave a second reason: PLAN-RETRACTION
+§4.2.1 permitted a negative head `-q(t̄)` only when the body carried the matching `not q(t̄)`,
+which — with this phase's **stratification check** (§2.2) — made "`q(ā)` and `-q(ā)` are never
+both derivable" true by construction, leaving the assert-time coherence check nothing to catch
+on the rule side.
 
-The CWA axiom is therefore the *motivating* case for negative rule heads, not merely an
-allowed one — the restriction was chosen so that this idiom is expressible and little else
-is. It needs both halves: `not` from this phase, `-p` from PLAN-RETRACTION Step 4. Since the
-restriction cannot be satisfied without `not`, negative-headed rules only become writable
-here, and **testing the axiom end-to-end belongs to this phase** (§2.5).
+**That restriction has been withdrawn** (see PLAN-RETRACTION §4.2.1). The coherence check now
+runs after every write and compares the two *relations*, so it catches what a rule derives, and
+the guarantee is maintained inductively by checking rather than by syntax. Consequences here:
+
+- Negative-headed rules are writable **now**, without `not`. The CWA axiom is still the
+  *motivating* case for them, but no longer the only expressible one.
+- The axiom still needs both halves — `not` from this phase, `-p` from PLAN-RETRACTION Step 4 —
+  so **testing it end-to-end still belongs to this phase** (§2.5).
+- Stratification is unaffected: `-q` is a distinct predicate in the dependency graph, so
+  `-q(X) :- dom(X), not q(X)` closes no cycle through negation.
+- §2.2 picks up an obligation from the withdrawal: once `not` exists, retraction stops being
+  monotonic (retracting `q(1)` makes `not q(1)` hold, which can derive `-p(1)` over a live
+  `p(1)`), so **`retract` must run the coherence check too**.
 
 ### 2.1 Formula shape — guards DONE, negated subgoals outstanding
 
@@ -581,10 +587,11 @@ Assertions: `?- q(1)` yes, `?- -q(1)` no, `?- q(2)` no, `?- -q(2)` yes — the t
 reading, with `q(3)` *unknown* (absent from both, since `3` is outside `dom`). Then the
 guarantee: `q` and `-q` are never both derivable — assert `q(2)` afterward and `?- -q(2)`
 goes empty, no contradiction and no error. Contrast cases: the same rule *without* the
-`not q(X)` literal is rejected by §4.2.1; without `dom(X)` it is rejected as unsafe; and
-`-p(X) :- q(X), not p(X)` is *accepted* where `p(X) :- q(X), not p(X)` is a stratification
-error — the negative head is a distinct predicate, which is exactly why the restriction is
-safe. (Guarded recursion staying bounded is
+`dom(X)` literal is rejected as unsafe; and `-p(X) :- q(X), not p(X)` is *accepted* where
+`p(X) :- q(X), not p(X)` is a stratification error — the negative head is a distinct
+predicate. (The `not q(X)` literal is no longer required in its own right; §4.2.1's
+restriction was withdrawn, and dropping it now yields a rule that is accepted unless it
+actually derives a contradiction.) (Guarded recursion staying bounded is
 already covered — `a guard applies inside a recursive rule` in `ComparisonGuardTests`.
 Related: `doesArithmetic` deliberately ignores guards, so arithmetic in a guard does *not*
 route a recursive predicate through the iterative evaluator — a guard filters rows and

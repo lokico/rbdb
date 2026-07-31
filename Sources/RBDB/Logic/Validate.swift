@@ -1,14 +1,22 @@
 import Foundation
 
-public enum ValidationError: Error, Equatable {
+public enum ValidationError: LocalizedError {
 	case unsafeVariables([Var])
 
-	public var localizedDescription: String {
+	// FIXME: Localize these strings
+	public var errorDescription: String? {
 		switch self {
 		case .unsafeVariables(let variables):
-			let varNames = variables.map { "var\($0.id ?? 255)" }.sorted().joined(separator: ", ")
-			return
-				"Unsafe variables in horn clause: \(varNames). Every variable in the head or in a comparison guard must also appear in a positive body literal."
+			let varNames = variables.map(\.description).sorted().joined(separator: ", ")
+			return "Unsafe variables: \(varNames)"
+		}
+	}
+
+	// FIXME: Localize these strings
+	public var failureReason: String? {
+		switch self {
+		case .unsafeVariables:
+			"Every variable in the head or in a comparison guard must also appear in a positive body literal."
 		}
 	}
 }

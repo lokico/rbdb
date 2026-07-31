@@ -1,6 +1,12 @@
 import RBDB
 import Parsing
 
+enum ParsingError: Error {
+	case conversionError
+	case expected(String)
+	case cannotPrintUnparseable(String)
+}
+
 /// Parser for Datalog syntax into RBDB Formula objects.
 public struct DatalogParser: ParserPrinter {
 
@@ -92,12 +98,10 @@ private struct HornClauseConversion: Conversion {
 
 	func unapply(_ output: Formula) throws -> (Predicate, [BodyItem]) {
 		guard case .hornClause(let head, let negatives, let guards) = output else {
-			throw ConversionError()
+			throw ParsingError.conversionError
 		}
 		return (head, negatives.map(BodyItem.predicate) + guards.map(BodyItem.comparison))
 	}
-
-	private struct ConversionError: Error {}
 }
 
 // MARK: - Predicate Parser
@@ -106,7 +110,8 @@ extension DatalogParser {
 	private var predicateParser: some ParserPrinter<Substring, Predicate> {
 		ParsePrint(.memberwise(Predicate.init(name:arguments:))) {
 			// Parse predicate name (identifier)
-			identifierParser
+			// (initial hyphen is for strong negation)
+			IdentifierParser(allowInitialHyphen: true)
 
 			// Parse arguments in parentheses
 			"("
@@ -199,8 +204,8 @@ extension DatalogParser {
 			Whitespace()
 			Many {
 				OneOf {
-					"+".map { AddOp.plus }
-					"-".map { AddOp.minus }
+					"+".printing(" + ").map { AddOp.plus }
+					"-".printing(" - ").map { AddOp.minus }
 				}
 				Whitespace()
 				multiplicativeExpressionParser
@@ -308,21 +313,33 @@ extension DatalogParser {
 	}
 
 	private var atomParser: some ParserPrinter<Substring, String> {
-		identifierParser
+		IdentifierParser()
 	}
 
-	private var identifierParser: some ParserPrinter<Substring, String> {
-		ParsePrint(.string) {
-			// Start with letter or underscore
-			Peek {
-				Prefix(1) { char in
-					char.isLetter || char == "_"
-				}
+	private struct IdentifierParser: ParserPrinter {
+		var allowInitialHyphen: Bool = false
+
+		func parse(_ input: inout Substring) throws -> String {
+			guard let first = input.popFirst(),
+				first.isLetter || first == "_" || (allowInitialHyphen && first == "-")
+			else {
+				throw ParsingError.expected(
+					allowInitialHyphen ? "letter, underscore, or hyphen" : "letter or underscore")
 			}
-			// Followed by alphanumeric characters or underscores
-			Prefix { char in
-				char.isLetter || char.isNumber || char == "_"
+
+			var prefix = input.prefix { $0.isLetter || $0.isNumber || $0 == "_" }
+			input.trimPrefix(prefix)
+
+			prefix.prepend(first)
+			return String(prefix)
+		}
+
+		func print(_ output: String, into input: inout Substring) throws {
+			var substr = output[...]
+			guard try parse(&substr) == output else {
+				throw ParsingError.cannotPrintUnparseable(output)
 			}
+			input.prepend(contentsOf: output)
 		}
 	}
 }

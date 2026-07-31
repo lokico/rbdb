@@ -1,4 +1,4 @@
-public protocol Symbol: Comparable, Codable {
+public protocol Symbol: Comparable, Codable, Sendable {
 	var type: SymbolType { get }
 	func rewrite<T: SymbolRewriter>(_ rewriter: T) -> Self
 	func reduce<T: SymbolReducer>(_ initialResult: T.Result, _ reducer: T) throws -> T.Result

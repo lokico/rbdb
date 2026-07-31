@@ -41,8 +41,15 @@ extension RBDB {
 	/// calling this again on an already-materialized cone just re-runs the fixpoint from the current
 	/// rows. In a positive (monotonic) program that only adds newly-derivable facts, which is exactly
 	/// what `refreshDirtyMaterializations` relies on to reflect newly asserted facts and rules without
-	/// dropping (and thus without taking the on-disk table lock).
+	/// dropping (and thus without taking the on-disk table lock). Retraction is the non-monotonic case
+	/// this cannot serve: `refreshDirtyMaterializations` drops those closures rather than extending them.
 	func materialize(topPredicate: String) throws {
+		// Suppress the materialized predicates' `BEFORE INSERT` triggers for the duration of this build:
+		//  the seed and the fixpoint write *derived* rows, which must land in the temp tables rather than
+		//  being asserted into `_rule`. `defer` so the throwing path clears it too.
+		materializingDepth += 1
+		defer { materializingDepth -= 1 }
+
 		let cone = try dependencyCone(of: topPredicate)
 
 		// Cone members with rules (derived predicates) are materialized as temp tables. Pure base-fact
@@ -84,6 +91,12 @@ extension RBDB {
 					"CREATE TEMP TABLE IF NOT EXISTS [\(entry.name)] (\(columnList), UNIQUE (\(columnList)))"
 				try super.query(sql: SQL(create))
 				touched.append(entry.name)
+
+				// The temp table has taken the predicate's name, so it must also take over its write
+				//  surface — otherwise an `INSERT`/`DELETE` that the view form asserts or retracts would
+				//  instead be silently applied to (and lost with) this table.
+				try createWriteTriggers(
+					for: entry.name, columns: entry.columns, backing: .materializedTable)
 
 				// Build the text first, then wrap: `SQL(String)` takes it verbatim, whereas an `SQL`
 				//  string *literal* would bind the interpolations as `?` parameters. Use `query` (not
@@ -140,23 +153,35 @@ extension RBDB {
 		}
 	}
 
-	/// Re-iterates every materialized closure the `_rule` trigger flagged stale (in `_dirty`), then
-	/// clears the flags. Called at the top of every `query` — a safe point, outside any trigger and with
-	/// no statement mid-flight — so the on-disk table lock that blocks an in-trigger `DROP` never
-	/// applies. Positive Datalog is monotonic, so re-running the fixpoint over the existing rows only
-	/// adds the newly-derivable facts; no drop-and-rebuild is needed.
+	/// Brings every materialized closure the `_rule` triggers flagged stale (in `_dirty`) up to date,
+	/// then clears the flags. Called at the top of every `query` — a safe point, outside any trigger and
+	/// with no statement mid-flight — so the on-disk table lock that blocks an in-trigger `DROP` never
+	/// applies.
+	///
+	/// Two modes, per the flagging trigger. An *addition* is monotonic: positive Datalog derives only
+	/// more from more, so re-running the fixpoint over the existing rows adds the newly-derivable facts
+	/// and nothing needs dropping. A *supersession* is not: re-iterating can never remove rows that are
+	/// no longer derivable, so `rebuild = 1` drops the closure outright.
 	func refreshDirtyMaterializations() throws {
 		// `materialize` runs queries of its own; guard against re-entering this refresh from them.
 		guard !isRefreshing else { return }
 		isRefreshing = true
 		defer { isRefreshing = false }
 
-		let dirty = try super.query(sql: "DELETE FROM _dirty RETURNING name")
-			.compactMap { $0["name"] as? String }
+		let dirty = try super.query(sql: "DELETE FROM _dirty RETURNING name, rebuild")
+			.compactMap { row -> (name: String, rebuild: Bool)? in
+				guard let name = row["name"] as? String else { return nil }
+				return (name, (row["rebuild"] as? Int64 ?? 0) != 0)
+			}
 		guard !dirty.isEmpty else { return }
 
-		for name in dirty {
-			if try coneIsFinite(name) {
+		for (name, rebuild) in dirty {
+			if rebuild {
+				// Something was retracted out from under this closure. Drop it and *don't* re-materialize:
+				//  the next query fails on the missing table and `rescue` rebuilds it from current data —
+				//  the cheapest correct option, and the same recovery path a failed build already uses.
+				try invalidateMaterialization(name)
+			} else if try coneIsFinite(name) {
 				try materialize(topPredicate: name)
 			} else {
 				// A newly-asserted rule made the cone value-generating (arithmetic under recursion): the
@@ -171,8 +196,9 @@ extension RBDB {
 	private func dropIfView(_ name: String) throws {
 		let isView =
 			try super.query(
-				sql: "SELECT 1 FROM temp.sqlite_schema WHERE type = 'view' AND name = \(name)"
-			).makeIterator().next() != nil
+				sql:
+					"SELECT 1 FROM temp.sqlite_schema WHERE type = 'view' AND name = \(name) LIMIT 1"
+			).hasMoreRows
 		guard isView else { return }
 		// Build the text first so `name` interpolates as a verbatim identifier: a `let` string is plain
 		//  Swift interpolation, whereas `SQL("… [\(name)]")` inline would parse as an `SQL` literal and
@@ -184,11 +210,41 @@ extension RBDB {
 
 	/// Drops a materialized closure and forgets its dependency rows, so the next query rebuilds it from
 	/// scratch (or, if it is no longer finite, routes it to the CTE).
+	///
+	/// The unit here is the whole *cone*, not the one table: a build materializes every derived member
+	/// of the top's dependency cone (`materialize`'s `derived` list), and those siblings are reachable
+	/// by name just like the top is. Only the top is registered in `_materialized_dep`, so a sibling is
+	/// invalidated by nothing of its own — dropping the top alone leaves it behind, holding rows that a
+	/// supersession has made underivable. That is what makes a retraction under a closure look like it
+	/// took no effect when the predicate is read through a different entry point than the one that built
+	/// it.
+	///
+	/// Dropping the siblings is never over-eager: for a member `M` of `cone(T)`, `cone(M) ⊆ cone(T)`, so
+	/// anything that could have invalidated `M` has already flagged `T`. Where a sibling is shared with
+	/// another live top, that top's own table is unaffected and the sibling is rebuilt on demand.
 	private func invalidateMaterialization(_ name: String) throws {
-		// The name is an identifier ⟹ inline it verbatim via `SQL(String)`; the `DELETE` below binds it
-		//  as a value parameter, which is correct there.
-		let drop = "DROP TABLE IF EXISTS [\(name)]"
-		try super.query(sql: SQL(drop))
+		// Only the *tables*. A cone's base-fact-only members are backed by temp views (created by
+		//  `materialize`), which read `_rule` live and so are never stale for a retracted fact; a retracted
+		//  *rule* drops them through `_invalidate_on_rule_supersede`. `DROP TABLE` on a view errors anyway.
+		let members =
+			try super.query(
+				sql: """
+					SELECT s.name FROM temp.sqlite_schema s
+					WHERE s.type = 'table'
+					  AND (s.name = \(name)
+					       OR s.name IN (SELECT depends_on FROM _materialized_dep
+					                     WHERE materialized_top = \(name)))
+					"""
+			).compactMap { $0["name"] as? String }
+
+		for member in members {
+			// The name is an identifier ⟹ inline it verbatim via `SQL(String)`; the `DELETE` below binds
+			//  it as a value parameter, which is correct there.
+			let drop = "DROP TABLE IF EXISTS [\(member)]"
+			try super.query(sql: SQL(drop))
+			try super.query(sql: "DELETE FROM _materialized_dep WHERE materialized_top = \(member)")
+		}
+		// Even if nothing was materialized under this name, its dependency rows must go.
 		try super.query(sql: "DELETE FROM _materialized_dep WHERE materialized_top = \(name)")
 	}
 }

@@ -12,7 +12,10 @@ public enum SymbolType: Comparable {
 	}
 
 	// formulas
-	case hornClause(positiveName: String)
+
+	/// A Horn clause, identified by its head predicate's name — *including* any polarity marker, as
+	/// `Predicate.name` carries it: `p` or `-p`, which are separate relations.
+	case hornClause(headName: String)
 
 	public var isFormula: Bool {
 		switch self {
@@ -49,12 +52,12 @@ extension SymbolType: CodingKey {
 		case .constant: ""
 		case .variable: "v"
 		case .arithmetic: "x"
-		case .hornClause(positiveName: let name): "@\(name)"
+		case .hornClause(headName: let name): "@\(name)"
 		}
 	}
 	public init?(stringValue: String) {
 		if stringValue.first == "@" {
-			self = .hornClause(positiveName: String(stringValue.dropFirst()))
+			self = .hornClause(headName: String(stringValue.dropFirst()))
 		} else {
 			switch stringValue {
 			case "": self = .constant

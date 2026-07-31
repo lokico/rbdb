@@ -617,18 +617,41 @@ func executeCommand(_ command: String, database: RBDB, mode: InputMode) {
 			printTable(results)
 
 		case .datalog(let isQueryMode):
-			let parser = DatalogParser()
-			let formula = try parser.parse(command)
 			if isQueryMode {
-				let results = try database.query(formula: formula)
+				let results = try database.query(datalog: command)
 				printTable(results)
 			} else {
-				try database.assert(formula: formula)
-				print("Asserted.")
+				// handle retraction
+				if command.hasSuffix("~") {
+					try database.retract(datalog: String(command.dropLast()))
+					print("Retracted.")
+				} else {
+					try database.assert(datalog: command)
+					print("Asserted.")
+				}
+			}
+		}
+	} catch CoherenceError.contradiction(contradicts: let inverse, derivedFrom: let derivedFrom) {
+		let datalog = DatalogParser()
+		print("Error: Contradicts known value:")
+		print("    \((try? datalog.print(inverse)) ?? String(describing: inverse)[...])")
+		if let derivedFrom = derivedFrom {
+			let retractions = derivedFrom.compactMap { try? datalog.print($0) + "~" }
+			if !retractions.isEmpty {
+				print("  Resolve with one or more of these retraction(s):")
+				for retraction in retractions {
+					print("    \(retraction)")
+				}
 			}
 		}
 	} catch {
-		print("Error: \(error)")
+		if let locError = error as? LocalizedError {
+			print("Error: \(locError.errorDescription ?? String(describing: error))")
+			if let failureReason = locError.failureReason { print(failureReason) }
+			if let recoverSuggestion = locError.recoverySuggestion { print(recoverSuggestion) }
+		} else {
+			print("Error: \(error)")
+		}
 	}
 }
 

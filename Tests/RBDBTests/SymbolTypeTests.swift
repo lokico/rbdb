@@ -11,5 +11,11 @@ import Testing
 }
 
 @Test func serializeRelationType() async throws {
-	try assertJSON(SymbolType.hornClause(positiveName: "Foo"), expect: "\"@Foo\"")
+	try assertJSON(SymbolType.hornClause(headName: "Foo"), expect: "\"@Foo\"")
+}
+
+@Test func serializeNegatedRelationType() async throws {
+	// `@-Foo`, not `-@Foo`: the leading `@` is what `negative_literal_count`'s `LIKE '@%'` guard and
+	//  `init?(stringValue:)`'s dispatch key off, and `output_type = '@Foo'` still excludes this row.
+	try assertJSON(SymbolType.hornClause(headName: "-Foo"), expect: "\"@-Foo\"")
 }

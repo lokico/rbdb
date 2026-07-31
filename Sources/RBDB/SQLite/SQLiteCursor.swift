@@ -25,6 +25,9 @@ public class SQLiteCursor: Sequence, IteratorProtocol {
 	private var statements: [PreparedStatement] = []
 	private var nextRow: Row?
 
+	public var hasMoreRows: Bool { nextRow != nil }
+	public var underestimatedCount: Int { nextRow != nil ? 1 : 0 }
+
 	internal init(_ db: SQLiteDatabase, sql: SQL) throws {
 		self.db = db
 		try prepareStatements(sql)
@@ -248,10 +251,6 @@ public class SQLiteCursor: Sequence, IteratorProtocol {
 			return currentRow
 		}
 		return nil
-	}
-
-	public var underestimatedCount: Int {
-		return nextRow != nil ? 1 : 0
 	}
 
 	func step(statement: PreparedStatement) throws -> Bool {

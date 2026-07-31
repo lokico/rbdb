@@ -1,6 +1,23 @@
-public struct Predicate: Equatable, Comparable {
+public struct Predicate: Equatable, Comparable, Sendable {
+	/// The relation this literal is about, *including* its polarity marker: `p` or `-p`. Polarity lives
+	/// in the name because `p` and `-p` really are separate relations — every site that resolves a
+	/// predicate to a table, a view, or an `output_type` should treat them as such, and does so with no
+	/// special-casing. `getColumns` is the one exception: a negative predicate is not separately
+	/// declared, so it borrows the positive form's columns.
 	public let name: String
 	public let arguments: [Term]
+
+	/// Whether this is a *strongly negated* literal — `-p(…)`, "known false" (as opposed to the
+	/// retraction of `p(…)`, which says only that `p` is no longer known true)
+	public var isNegated: Bool { name.hasPrefix("-") }
+
+	/// The name with any polarity marker removed.
+	public var positiveName: String { isNegated ? String(name.dropFirst()) : name }
+
+	/// This literal with its polarity flipped: the one whose derivability contradicts this one's.
+	public var inverse: Predicate {
+		Predicate(name: isNegated ? positiveName : "-\(name)", arguments: arguments)
+	}
 
 	public init(name: String, arguments: [Term]) {
 		self.name = name.lowercased()

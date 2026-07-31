@@ -1,4 +1,4 @@
-public protocol Expression: Codable, Comparable, CustomDebugStringConvertible {
+public protocol Expression: Codable, Comparable, CustomDebugStringConvertible, Sendable {
 	associatedtype Op: CodingKey, RawRepresentable where Op.RawValue: Comparable
 	var operation: Op { get }
 	var operands: [Term] { get }

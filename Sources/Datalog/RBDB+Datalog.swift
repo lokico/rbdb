@@ -19,4 +19,13 @@ extension RBDB {
 		let formula = try parser.parse(datalog)
 		try assert(formula: formula)
 	}
+
+	/// Convenience method to retract using datalog syntax
+	/// - Parameter datalog: A datalog assertion string (e.g., "user('Alice')")
+	/// - Throws: Parsing errors, or `RetractionError.notFound` if no live row matches
+	public func retract(datalog: String) throws {
+		let parser = DatalogParser()
+		let formula = try parser.parse(datalog)
+		try retract(formula: formula)
+	}
 }

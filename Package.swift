@@ -58,9 +58,6 @@ let package = Package(
 			name: "DatalogTests",
 			dependencies: ["Datalog", "RBDB"]
 		),
-		.systemLibrary(
-			name: "SQLite3",
-			pkgConfig: "sqlite3"
-		),
+		.systemLibrary(name: "SQLite3"),
 	]
 )

@@ -451,20 +451,35 @@ declared out of band:
 `closed` declaration on `_predicate` (see its §2.0 for why that is preferable, and for the
 range-restriction requirement that makes the `dom` literals mandatory).
 
-**Restriction (§4.2.1): a negative head requires the matching negated subgoal in the body.**
-`-foo(t̄)` may appear as a head only if the body contains `not foo(t̄)` with the *same*
-argument terms. This is what keeps rules from introducing contradictions the ground-fact check
-in §4.2 cannot see, and — combined with the stratification check — it is a real guarantee
-rather than a heuristic: when `-foo(ā)` is derived, `not foo(ā)` held, so `foo(ā)` was not
-derivable; and `foo` cannot depend back on `-foo`, because that is a cycle through negation
-and the stratification check (PLAN-EVENTS §2.2) rejects it. So `foo(ā)` and `-foo(ā)` cannot
-both be derivable.
+**~~Restriction (§4.2.1): a negative head requires the matching negated subgoal in the
+body.~~ Withdrawn — see below.** As shipped, `-foo(t̄)` could head a rule only if the body
+contained `not foo(t̄)` over the same argument terms. The restriction bought exactly one
+thing: it kept rules from introducing contradictions that the *then* ground-fact-and-one-
+relation check in §4.2 could not see, so that the check had "nothing left to catch on the rule
+side" (PLAN-EVENTS §2.0).
+
+That premise no longer holds. §4.2's check now runs after **every** write and scans every
+relation with a live negative side, comparing the two *relations* — base facts unioned with
+rule arms — so a contradiction a rule derives is caught by checking rather than by
+construction. Since retraction in positive Datalog is monotonically decreasing, it cannot
+create one, and the invariant holds inductively across every state the database can reach.
+The restriction was therefore removed along with `InvalidNegativeHeadCollector` and
+`ValidationError.headInvalidWithoutNegatedSubgoal`; a negative head is now an ordinary head.
+
+**The one obligation this transfers.** The static guarantee held for all future states; the
+dynamic one holds because every state change is checked. That stays true only while retraction
+is monotonic. Once negation-as-failure lands, retracting `q(1)` makes `not q(1)` hold and can
+newly derive `-p(1)` over a live `p(1)` — so **`retract` must run the coherence check too**
+(noted at `checkCoherence`). Stratification (PLAN-EVENTS §2.2) is unaffected: `-p` is a
+distinct predicate in the dependency graph, which is why `-p(X) :- q(X), not p(X)` was always
+stratifiable where `p(X) :- q(X), not p(X)` is not.
 
 Two consequences worth being explicit about:
 
-- **It needs `not`.** Until PLAN-EVENTS Phase 2 lands there is no way to satisfy the
-  restriction, so this step ships negative **facts** only, plus the head encoding and the
-  validation rule. The first legal negative-headed rule is the CWA axiom above.
+- **~~It needs `not`.~~** While the restriction stood, nothing could satisfy it before
+  PLAN-EVENTS Phase 2, so this step shipped negative **facts** only. With it withdrawn,
+  negative-headed rules are writable now; the CWA axiom above still needs `not`, but it is no
+  longer the *first* such rule.
 - **It rules out `-alive(X) :- dead(X).`** — you must write
   `-alive(X) :- dead(X), not alive(X).` Arguably better (it will not derive a contradiction
   from someone having asserted both `alive(x)` and `dead(x)`), but it *suppresses* that
@@ -672,10 +687,13 @@ inverse does not block, so retract-then-assert works through this path too; the 
 has been built); and the `WHEN` short-circuit means a predicate with nothing negative asserted
 about it never forces `[-p]` into existence.
 
-**Restriction (§4.2.1):** `-p(X) :- q(X).` is rejected; `-p(X) :- q(X), not p(X).` is accepted.
-Since `not` does not exist until PLAN-EVENTS Phase 2, the acceptance half is a pending test
-there — as is the CWA axiom end-to-end. What is testable now is the rejection, and that the
-encoding round-trips a negative-headed rule through storage and `fetchRules`.
+**~~Restriction (§4.2.1)~~ — withdrawn.** `-p(X) :- q(X).` is *accepted*; where it would derive
+the inverse of something live, §4.2's check refuses the assert and names the collision. Tested
+by `negativeHeadMatchesPositive` / `negativeHeadRecursion` (a negative head derives, chains,
+recurses, retracts and reads back through both surfaces exactly as the positive form does) and
+`negativeHeadedRuleContradiction` (`-alive(X) :- dead(X)` over a live `alive(1)`, in either
+arrival order). The CWA axiom end-to-end still belongs to PLAN-EVENTS Phase 2, since it needs
+`not`.
 
 ---
 
@@ -690,14 +708,16 @@ encoding round-trips a negative-headed rule through storage and `fetchRules`.
   derived it succeeds while the row stays visible. Correct — the assertion was retracted, the
   conclusion still follows — but it violates the reflex that `DELETE` makes rows go away, so it
   needs saying in the docs, not just the tests (§1b).
-- **Contradiction detection is at assert time, on ground facts** — by querying the inverse
-  relation, in Swift on the `assert` path (§4.2) and in the per-predicate trigger on the SQL
-  path (§4.2.2), so both catch stored *and* derived inverses. Neither can detect a
-  contradiction that only becomes derivable *later*, when a subsequent rule or fact makes the
-  inverse reachable. Negative rule heads are kept safe by the §4.2.1 restriction instead of by
-  checking; lifting that restriction requires real integrity constraints (PLAN-EVENTS Phase 5).
-- **Contradictions arising from a rule are suppressed, not reported** — the §4.2.1 restriction
-  means a negative-headed rule simply does not fire where its positive counterpart holds.
+- **Contradiction detection is at write time** — one check, called from the `assert` path and
+  from `RBDBCursor` once a writing SQL statement completes, both inside a savepoint that undoes
+  the write on a throw. It scans every relation with a live negative side and compares the two
+  *relations*, so stored and derived collisions are caught alike, including one completed by a
+  write that mentions neither polarity. What it does not do is explain itself: where the
+  offending literal is only derived, `derivedFrom` is nil, because bottom-up SQL evaluation
+  discards the proof. PLAN-EVENTS Phase 5's abduction engine is what fills that in.
+- **The scan is unoptimized** — one `INTERSECT` per candidate relation per write. The candidate
+  set is usually empty (one indexed probe), and the lever when it is not is to skip a candidate
+  whose `dependencyCone` does not contain what was just written.
 - **No group retraction** — retracting a whole scenario at once is PLAN-EVENTS §4.2's
   `group_name`, unchanged by this plan and still pending.
 - **"Unknown" is not surfaced as an answer value.** The three-valued *semantics* is here
