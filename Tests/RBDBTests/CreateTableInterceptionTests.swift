@@ -138,20 +138,72 @@ struct CreateTableInterceptionTests {
 		}
 	}
 
-	@Test("CREATE TABLE with quoted column names throws error")
-	func createTableWithQuotedColumnsThrows() async throws {
+	@Test("CREATE TABLE with quoted column names")
+	func createTableWithQuotedColumns() async throws {
 		let rbdb = try RBDB(path: ":memory:")
 
-		// Execute a CREATE TABLE with quoted column names should throw an error
-		#expect(throws: SQLiteError.self) {
+		try rbdb.query(
+			sql: """
+				    CREATE TABLE quoted_table (
+				        "user id" INTEGER,
+				        `full name` TEXT,
+				        [display name] TEXT,
+				        'nick name' TEXT
+				    )
+				"""
+		)
+
+		let results = Array(
 			try rbdb.query(
-				sql: """
-					    CREATE TABLE quoted_table (
-					        "user id" INTEGER,
-					        name TEXT
-					    )
-					"""
+				sql:
+					"SELECT json(column_names) as column_names_json FROM _predicate WHERE name = 'quoted_table'"
+			))
+
+		#expect(results.count == 1, "Should have one predicate record")
+
+		if let columnNamesJson = results[0]["column_names_json"] as? String,
+			let columnNamesData = columnNamesJson.data(using: .utf8)
+		{
+			let columnNames =
+				try JSONSerialization.jsonObject(with: columnNamesData)
+				as? [String]
+			#expect(
+				columnNames == ["user id", "full name", "display name", "nick name"],
+				"Quoted column names should be parsed and unquoted correctly"
 			)
+		} else {
+			#expect(Bool(false), "column_names should be accessible as JSON")
+		}
+	}
+
+	@Test("CREATE TABLE with an escaped quote inside a quoted column name")
+	func createTableWithEscapedQuoteInColumnName() async throws {
+		let rbdb = try RBDB(path: ":memory:")
+
+		let sql =
+			"CREATE TABLE escaped_quote_table (\"escaped \"\"quote\"\"\" INTEGER, name TEXT)"
+		try rbdb.query(sql: SQL(sql))
+
+		let results = Array(
+			try rbdb.query(
+				sql:
+					"SELECT json(column_names) as column_names_json FROM _predicate WHERE name = 'escaped_quote_table'"
+			))
+
+		#expect(results.count == 1, "Should have one predicate record")
+
+		if let columnNamesJson = results[0]["column_names_json"] as? String,
+			let columnNamesData = columnNamesJson.data(using: .utf8)
+		{
+			let columnNames =
+				try JSONSerialization.jsonObject(with: columnNamesData)
+				as? [String]
+			#expect(
+				columnNames == ["escaped \"quote\"", "name"],
+				"Doubled quote characters inside a quoted column name should be unescaped"
+			)
+		} else {
+			#expect(Bool(false), "column_names should be accessible as JSON")
 		}
 	}
 

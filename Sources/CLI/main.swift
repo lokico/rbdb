@@ -15,7 +15,7 @@ import Datalog
 
 let productName = "RBDB Interactive Console"
 
-enum InputMode {
+enum InputMode: Equatable {
 	case sql
 	case datalog(isQueryMode: Bool)
 
@@ -63,6 +63,7 @@ func printUsage() {
 	print("Commands:")
 	print("  .exit                Exit the console")
 	print("  .schema              Show database schema")
+	print("  .lang[uage] <lang>   Switch language: s[ql] or d[atalog]")
 	print("")
 	print("Interactive Mode:")
 	print("  Shift+Tab            Switch between SQL and Datalog modes")
@@ -105,20 +106,84 @@ func displaySchema(database: SQLiteDatabase) {
 	}
 }
 
-func executeCommandsFromFile(filePath: String, database: RBDB, mode: InputMode) -> Bool {
-	do {
-		let content = try String(contentsOfFile: filePath, encoding: .utf8)
+enum DotCommandOutcome: Equatable {
+	case exit
+	case handled
+	case notADotCommand
+}
 
-		print("Executing commands from file: \(filePath) (mode: \(mode.displayName))")
-
-		executeCommand(content, database: database, mode: mode)
-
-		print("File execution completed.")
-		return true  // Continue to interactive mode
-	} catch {
-		print("Error reading file '\(filePath)': \(error)")
-		exit(1)
+/// Handles REPL commands that begin with `.` (`.exit`, `.schema`, `.lang`/`.language`), shared between
+/// interactive and non-interactive mode. `.lang`/`.language` mutates `mode` in place when followed by a
+/// language recognized by `parseLanguage`.
+func handleDotCommand(
+	_ command: String, database: SQLiteDatabase, mode: inout InputMode
+) -> DotCommandOutcome {
+	let parts = command.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+	guard let commandName = parts.first.map(String.init) else {
+		return .notADotCommand
 	}
+
+	switch commandName {
+	case ".exit":
+		return .exit
+	case ".schema":
+		displaySchema(database: database)
+		return .handled
+	case ".lang", ".language":
+		let argument = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespaces) : ""
+		if let newMode = parseLanguage(argument) {
+			mode = newMode
+			print("Switched to \(newMode.displayName) mode")
+		} else {
+			print("Error: Unknown language '\(argument)'. Use 's'/'sql' or 'd'/'datalog'")
+		}
+		return .handled
+	default:
+		return .notADotCommand
+	}
+}
+
+func executeCommandsFromFile(filePath: String, database: RBDB, mode initialMode: InputMode)
+	async throws -> Bool
+{
+	let url = URL(filePath: filePath, directoryHint: .notDirectory)
+
+	print("Executing commands from file: \(filePath) (mode: \(initialMode.displayName))")
+
+	var mode = initialMode
+	var buffer = ""
+
+	func flushBuffer() {
+		let pending = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+		if !pending.isEmpty {
+			executeCommand(pending, database: database, mode: mode)
+		}
+		buffer = ""
+	}
+
+	for try await line in url.lines {
+		let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+		if trimmedLine.hasPrefix(".") {
+			flushBuffer()
+			switch handleDotCommand(trimmedLine, database: database, mode: &mode) {
+			case .exit:
+				print("File execution completed.")
+				return false  // .exit means don't continue to interactive mode
+			case .handled:
+				continue
+			case .notADotCommand:
+				break
+			}
+		}
+
+		buffer += line + "\n"
+	}
+
+	flushBuffer()
+
+	print("File execution completed.")
+	return true  // Continue to interactive mode
 }
 
 func formatPage<I: IteratorProtocol<Row>>(_ iter: inout I) -> String? {
@@ -408,7 +473,7 @@ func readLineWithHistory(
 	}
 }
 
-func main() {
+func main() async throws {
 	let args = CommandLine.arguments
 
 	// Handle --help
@@ -501,7 +566,7 @@ func main() {
 
 	// Execute SQL file if provided
 	if let sqlFile = sqlFile {
-		let shouldContinue = executeCommandsFromFile(
+		let shouldContinue = try await executeCommandsFromFile(
 			filePath: sqlFile,
 			database: database,
 			mode: defaultMode
@@ -540,7 +605,7 @@ func runInteractiveMode(database: RBDB, defaultMode: InputMode) {
 	}
 
 	// Main loop
-	while true {
+	replLoop: while true {
 		print(mode.prompt, terminator: "")
 		fflush(stdout)
 
@@ -560,14 +625,14 @@ func runInteractiveMode(database: RBDB, defaultMode: InputMode) {
 			continue
 		}
 
-		if command == ".exit" {
-			break
-		}
-
-		if command == ".schema" {
-			displaySchema(database: database)
+		switch handleDotCommand(command, database: database, mode: &mode) {
+		case .exit:
+			break replLoop
+		case .handled:
 			print()
 			continue
+		case .notADotCommand:
+			break
 		}
 
 		// Add to history if it's not empty and not the same as the last command
@@ -588,6 +653,8 @@ func runInteractiveMode(database: RBDB, defaultMode: InputMode) {
 }
 
 func runNonInteractiveMode(database: RBDB, defaultMode: InputMode) {
+	var mode = defaultMode
+
 	// Read from stdin line by line
 	while let line = readLine() {
 		let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -596,16 +663,16 @@ func runNonInteractiveMode(database: RBDB, defaultMode: InputMode) {
 			continue
 		}
 
-		if command == ".exit" {
+		switch handleDotCommand(command, database: database, mode: &mode) {
+		case .exit:
+			return
+		case .handled:
+			continue
+		case .notADotCommand:
 			break
 		}
 
-		if command == ".schema" {
-			displaySchema(database: database)
-			continue
-		}
-
-		executeCommand(command, database: database, mode: defaultMode)
+		executeCommand(command, database: database, mode: mode)
 	}
 }
 
@@ -655,4 +722,4 @@ func executeCommand(_ command: String, database: RBDB, mode: InputMode) {
 	}
 }
 
-main()
+try await main()

@@ -146,21 +146,55 @@ private func processColumn(
 		)
 	}
 
+	// Quoted column names: "double quoted", `backticked`, [bracketed], or 'single quoted'
+	if let openChar = trimmed.first, "\"'`[".contains(openChar) {
+		guard let columnName = parseQuotedColumnName(from: trimmed) else {
+			throw SQLiteError.queryError(
+				"Unterminated quoted column name: \(trimmed)"
+			)
+		}
+		if !columnName.isEmpty {
+			columnNames.append(columnName)
+		}
+		return
+	}
+
 	// Extract column name (first word before space or type)
 	if let columnName = trimmed.components(separatedBy: .whitespacesAndNewlines)
 		.first
 	{
-		// Check for quoted column names and reject them
-		if columnName.hasPrefix("\"") || columnName.hasPrefix("'")
-			|| columnName.hasPrefix("`") || columnName.hasPrefix("[")
-		{
-			throw SQLiteError.queryError(
-				"Quoted column names are not supported: \(columnName)"
-			)
-		}
-
 		if !columnName.isEmpty {
 			columnNames.append(columnName)
 		}
 	}
+}
+
+/// Parses a quoted column name from the start of `trimmed`, which must begin with `"`, `'`,
+/// `` ` ``, or `[`. A doubled quote character escapes a literal quote inside the name (SQLite's
+/// rule for `"`, `'`, and `` ` ``); `[...]` has no escape mechanism and simply ends at the next `]`.
+/// Returns `nil` if the closing quote is never found.
+private func parseQuotedColumnName(from trimmed: String) -> String? {
+	let openChar = trimmed[trimmed.startIndex]
+	let closeChar: Character = openChar == "[" ? "]" : openChar
+	let allowsDoubledEscape = openChar != "["
+
+	var name = ""
+	var index = trimmed.index(after: trimmed.startIndex)
+	while index < trimmed.endIndex {
+		let char = trimmed[index]
+		if char == closeChar {
+			let nextIndex = trimmed.index(after: index)
+			if allowsDoubledEscape, nextIndex < trimmed.endIndex,
+				trimmed[nextIndex] == closeChar
+			{
+				name.append(closeChar)
+				index = trimmed.index(after: nextIndex)
+				continue
+			}
+			return name
+		}
+		name.append(char)
+		index = trimmed.index(after: index)
+	}
+	return nil
 }

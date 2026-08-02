@@ -58,6 +58,10 @@ let package = Package(
 			name: "DatalogTests",
 			dependencies: ["Datalog", "RBDB"]
 		),
+		.testTarget(
+			name: "CLITests",
+			dependencies: ["CLI"]
+		),
 		.systemLibrary(name: "SQLite3"),
 	]
 )
