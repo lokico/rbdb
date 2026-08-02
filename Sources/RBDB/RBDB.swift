@@ -3,6 +3,10 @@ import SQLite3
 
 public enum RBDBError: Error {
 	case corruptData(message: String)
+
+	/// Another connection already has this database open. A database serves one connection at a time —
+	/// see ``RBDB/RBDB/init(path:)`` — so release the first one before opening a second.
+	case databaseInUse(path: String)
 }
 
 public enum RetractionError: Error {
@@ -31,8 +35,20 @@ public class RBDB: SQLiteDatabase {
 	/// the inner one while the outer is still running.
 	var materializingDepth = 0
 
-	// FIXME: Can we validate that it's actually an RBDB?
+	/// Opens the database at `path`, creating it if it isn't there and bringing its schema up to date.
+	///
+	/// Currently, a database serves **one connection at a time**: this one holds an exclusive lock on
+	/// the file for as long as it lives, so opening a second `RBDB` on the same path — from this process
+	/// or any other, to read or to write — throws ``RBDBError/databaseInUse(path:)``. Release the first
+	/// one and the next can open. We hope to lift this restriction in the future.
+	///
+	/// - Parameter path: The file system path to the database file, or `":memory:"` for an in-memory
+	///   database.
+	/// - Throws: ``RBDBError/databaseInUse(path:)`` if another connection has this database open.
+	/// - Throws: ``SQLiteError/couldNotOpenDatabase(_:)`` if the database cannot be opened, or
+	///   ``SQLiteError/couldNotRegisterFunction(name:)`` if its custom SQL functions cannot be registered.
 	public override init(path: String) throws {
+		// FIXME: Can we validate that it's actually an RBDB?
 		try super.init(path: path)
 
 		// Set flag to allow schema tables to be created during initialization
@@ -73,14 +89,52 @@ public class RBDB: SQLiteDatabase {
 			throw SQLiteError.couldNotRegisterFunction(name: "is_materializing")
 		}
 
+		try claimExclusively(path: path)
+
 		// Migrate the schema
 		try super.query(
 			sql: SQL(String(decoding: PackageResources.schema_sql, as: UTF8.self))
 		)
 	}
 
+	/// Takes this database for this connection alone, and refuses to open if someone else has it.
+	///
+	/// **One connection per database is a correctness requirement, not a performance choice.** Both the
+	/// coherence check and the temp views/closures a query is answered from are per-connection: the
+	/// `_invalidate_on_rule_*` triggers are compiled into the statement that fires them, so they run
+	/// only on the connection doing the write, and `_dirty`/`_materialized_dep` are `TEMP` besides. A
+	/// second connection would therefore answer from a rule set it alone believes in — and, worse, could
+	/// write a fact whose contradiction is only visible through rules the checking connection can't see.
+	/// Until invalidation is shared (a schema counter in `main` that a connection checks as it reads),
+	/// the only sound number of connections is one.
+	///
+	/// `locking_mode = EXCLUSIVE` alone would not settle it. It takes no lock of its own: a *shared*
+	/// lock is taken at the first read and an exclusive one at the first write, and only then are they
+	/// held for the life of the connection. Opening an already-migrated database need not write at all
+	/// — the schema is `IF NOT EXISTS` throughout and its temp objects live in another database — so
+	/// two connections could each settle for a shared lock and coexist as readers. `BEGIN EXCLUSIVE`
+	/// takes the write lock outright; the pragma is what then keeps it after the `COMMIT`.
+	private func claimExclusively(path: String) throws {
+		try super.query(sql: "PRAGMA locking_mode = EXCLUSIVE")
+		do {
+			try super.query(sql: "BEGIN EXCLUSIVE TRANSACTION")
+			try super.query(sql: "COMMIT")
+		} catch let error as SQLiteError {
+			guard sqlite3_errcode(db) == SQLITE_BUSY else { throw error }
+			throw RBDBError.databaseInUse(path: path)
+		}
+	}
+
 	@discardableResult
 	public override func query(sql: SQL) throws -> SQLiteCursor {
+		try query(sql: sql, demand: nil)
+	}
+
+	/// - Parameter demand: What the statement pins about the predicate it asks, where the caller built
+	///   it from a `Formula` and so knows. Only used if the statement has to be rescued, and only for a
+	///   recursion that needs bounding; `nil` leaves `rescue` to recover it from the statement text.
+	@discardableResult
+	func query(sql: SQL, demand: Demand?) throws -> SQLiteCursor {
 		// Bring any materialized closures the `_rule` trigger flagged stale up to date before reading.
 		//  Done here rather than in the trigger so it runs at a safe point — re-iterating, never
 		//  dropping — which sidesteps the on-disk table lock. See `refreshDirtyMaterializations`.
@@ -91,7 +145,7 @@ public class RBDB: SQLiteDatabase {
 			// Only attempt to rescue if we have an index to resume from, so
 			//  we don't risk re-executing any potentially non-idempotent commands.
 			if case .queryError(_, let index) = error, let index = index,
-				let cursor = try rescue(error: error, in: sql, at: index)
+				let cursor = try rescue(error: error, in: sql, at: index, demand: demand)
 			{
 				return cursor
 			}
@@ -137,6 +191,13 @@ public class RBDB: SQLiteDatabase {
 								  AND formula = jsonb(\(try formulaToJSON(redundant)))
 								""")
 					}
+				}
+
+				// A rule is the only thing that can change the *shape* of a predicate's dependency cone,
+				//  and this is the moment it changes — so it is where the views that shape invalidates are
+				//  dropped, rather than at every later query that would have to notice.
+				if case .hornClause(let head, let body, _) = canonical.store, !body.isEmpty {
+					try invalidateViewsOverValueGeneratingCones(after: head.name)
 				}
 			}
 
@@ -188,17 +249,21 @@ public class RBDB: SQLiteDatabase {
 		// want to preserve the variable names for the columns of the result set.
 
 		var columnsQuery: SQLiteCursor? = nil
+		var queriedColumns: [String] = []
 		let sql = try formula.queryIntoSQL({ predicateName in
 			guard
 				let columns = try self.getColumns(for: predicateName, query: &columnsQuery)
 			else {
 				throw SQLiteError.queryError("no such table: \(predicateName)")
 			}
+			queriedColumns = columns
 			return columns
 		})
 
-		// Not calling `super.query` here because we want the view generation
-		return try query(sql: SQL(sql))
+		// Not calling `super.query` here because we want the view generation. The formula states what
+		//  the query pins outright, so hand that along rather than leaving `rescue` to read it back out
+		//  of the SQL just generated — see `Demand`.
+		return try query(sql: SQL(sql), demand: Demand(of: formula, columns: queriedColumns))
 	}
 
 	private func validatePredicatesExist(in formula: Formula) throws {
@@ -494,7 +559,9 @@ public class RBDB: SQLiteDatabase {
 		return columnNames
 	}
 
-	private func rescue(error: SQLiteError, in sql: SQL, at startIndex: SQL.Index) throws
+	private func rescue(
+		error: SQLiteError, in sql: SQL, at startIndex: SQL.Index, demand: Demand?
+	) throws
 		-> SQLiteCursor?
 	{
 		guard case .queryError(let msg, _) = error,
@@ -525,13 +592,48 @@ public class RBDB: SQLiteDatabase {
 					topPredicate: predicateName,
 					topColumns: columnNames,
 					sql: retrySQL,
+					demand: demand
 				)
 			}
 		} else {
 			let rules = try fetchRules(for: predicateName)
 			try createViewAndTrigger(for: predicateName, columns: columnNames, rules: rules)
 		}
-		return try query(sql: retrySQL)
+		return try query(sql: retrySQL, demand: demand)
+	}
+
+	/// Drops every temp view whose dependency cone now holds a value-generating predicate.
+	///
+	/// Such a predicate is reachable only through a `WITH RECURSIVE` prefix, and a prefix is invisible
+	/// inside a view — SQLite compiles a view's body in its own scope. So a view over a cone that has
+	/// just turned value-generating is not stale in the ordinary sense but *unusable*: the statement
+	/// fails on the predicate the view names, and the rescue prefixes a CTE that the view still can't
+	/// see. The predicate has to be inlined into the outer query instead, which is what `rescue` does
+	/// once the view is gone.
+	///
+	/// Called when a rule is asserted, which is the only thing that can change a cone's shape. Doing it
+	/// here rather than from `rescue` is what keeps it off the read path: a value-generating predicate
+	/// is never backed by a view, so *every* query over one is a rescue, and a check made there would
+	/// be paid on each of them forever — for a state only an assert can create.
+	///
+	/// - Parameter head: The stored rule's head. Nothing can have turned value-generating unless this
+	///   predicate is now caught in a cycle, which is what makes the scan below skippable for the
+	///   ordinary non-recursive rule. Being value-generating means being recursive *and* doing
+	///   arithmetic somewhere: the new rule can only supply the arithmetic to its own head, and any
+	///   cycle it newly closes runs through that head — so either way the head is on a cycle.
+	private func invalidateViewsOverValueGeneratingCones(after head: String) throws {
+		guard try involvesRecursion(head) else { return }
+
+		let views = try super.query(
+			sql: "SELECT name FROM temp.sqlite_schema WHERE type = 'view'"
+		).compactMap { $0["name"] as? String }
+
+		for view in views where try !coneIsFinite(view) {
+			// The name is an identifier, so build the text first: an `SQL` literal would bind the
+			//  interpolation as a `?` parameter. Dropping a view drops its triggers with it.
+			let drop = "DROP VIEW IF EXISTS [\(view)]"
+			try super.query(sql: SQL(drop))
+		}
 	}
 
 	func fetchRules(for predicateName: String) throws -> [Formula] {

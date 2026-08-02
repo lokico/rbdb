@@ -38,6 +38,8 @@ swift run rbdb1 -f script.sql database.db
 swift run rbdb1
 ```
 
+For now, you can only open one connection to a given database file at a time.
+
 Example session:
 ```sql
 sql> CREATE TABLE product (id, name, price);

@@ -16,6 +16,21 @@ try db.query(sql: "CREATE TABLE grandparent(grandparent, grandchild)")
 try db.query(sql: "CREATE TABLE sibling(s1, s2)")
 ```
 
+### One connection at a time
+
+Currently, a database serves **one connection at a time**, holding an exclusive lock on the file for as long
+as that connection lives. A second ``RBDB`` on the same path throws ``RBDBError/databaseInUse(path:)``.
+Release the first one and the next can open:
+
+```swift
+var db: RBDB? = try RBDB(path: "family.db")
+// …
+db = nil                                  // the database is free again
+let other = try RBDB(path: "family.db")   // now this opens
+```
+
+We hope to lift this restriction in the future.
+
 ## Asserting facts
 
 Facts are ``Formula`` values. You can build them directly, but usually, you'll just use SQL or Datalog syntax:
@@ -121,6 +136,12 @@ Negative predicates can also be the head of rules:
 ```swift
 try db.assert(datalog: "-parent(X, Y) :- disowned(X, Y).")
 ```
+
+One shape can't be checked: where *both* polarities generate values (arithmetic under recursion, so
+each can run past any finite set of arguments), whether they ever agree on one is not a question the
+engine can settle. Rather than accept such writes unchecked, the write that would leave a relation
+that way throws `CoherenceError.undecidable` — retract either side's value-generating rule and it
+goes through.
 
 ## Next steps
 

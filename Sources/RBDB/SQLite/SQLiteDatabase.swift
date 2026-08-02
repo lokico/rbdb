@@ -40,8 +40,8 @@ public class SQLiteDatabase {
 	/// custom functions like `uuidv7()`.
 	///
 	/// - Parameter path: The file system path to the database file, or ":memory:" for an in-memory database
-	/// - Throws: `SQLiteError.couldNotOpenDatabase` if the database cannot be opened
-	/// - Throws: `SQLiteError.couldNotRegisterFunction` if custom functions cannot be registered
+	/// - Throws: ``SQLiteError/couldNotOpenDatabase(_:)`` if the database cannot be opened
+	/// - Throws: ``SQLiteError/couldNotRegisterFunction(name:)`` if custom functions cannot be registered
 	public init(path: String) throws {
 		if sqlite3_open_v2(
 			path,
@@ -99,8 +99,8 @@ public class SQLiteDatabase {
 	///
 	/// - Parameter sql: The SQL query with embedded parameters
 	/// - Returns: An array of dictionaries representing the result set from the last statement that produced results
-	/// - Throws: `SQLiteError.queryParameterCount` if parameter count doesn't match placeholders
-	/// - Throws: `SQLiteError.queryError` if SQL execution fails
+	/// - Throws: ``SQLiteError/queryParameterCount(expected:got:)`` if parameter count doesn't match placeholders
+	/// - Throws: ``SQLiteError/queryError(_:index:)`` if SQL execution fails
 	///
 	/// ## Example
 	/// ```swift

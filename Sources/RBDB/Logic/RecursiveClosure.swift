@@ -1,5 +1,34 @@
 import Foundation
 
+/// What a query pins about the predicate it asks: column name → the ground term that column must
+/// equal. This is the *demand*, and it is what makes an otherwise-infinite recursion terminate —
+/// `nat(99)` is answerable where `SELECT … FROM [nat]` is not, because 99 bounds the recursive step.
+///
+/// Carried as structure from the `Formula` the query was written as, rather than recovered from the
+/// SQL that formula generated. `extractEqualityConstraints` is the recovery path, and exists only for
+/// SQL that never was a formula — raw statements typed at the CLI.
+struct Demand {
+	/// The predicate the constraints are columns of.
+	let predicate: String
+	let constraints: [String: Term]
+
+	/// The demand a single-literal query places on its predicate: every ground argument pins its
+	/// column. An argument holding a variable pins nothing — it is what the query asks *for*.
+	init?(of formula: Formula, columns: [String]) {
+		guard case .hornClause(let head, let negatives, _) = formula, negatives.isEmpty else {
+			return nil
+		}
+		var constraints: [String: Term] = [:]
+		for (i, argument) in head.arguments.enumerated()
+		where i < columns.count && argument.freeVariables.isEmpty {
+			constraints[columns[i]] = argument
+		}
+		guard !constraints.isEmpty else { return nil }
+		self.predicate = head.name
+		self.constraints = constraints
+	}
+}
+
 // Recursive-predicate detection and the query-time `WITH RECURSIVE` closure builder that lets
 // recursive and recursion-dependent predicates be queried. See `buildRecursiveClosureCTE`.
 extension RBDB {
@@ -41,15 +70,16 @@ extension RBDB {
 	func buildRecursiveClosureCTE(
 		topPredicate: String,
 		topColumns: [String],
-		sql: SQL
+		sql: SQL,
+		demand: Demand? = nil
 	) throws -> SQL {
 		var stmt = String(sql.queryText.utf8.dropFirst(sql.startIndex.queryOffset))!
 
 		// Thread the query's constraints down the dependency graph so each self-recursive predicate
 		//  learns the bounds that make its recursion terminate (first path to reach it wins).
-		var recursiveConstraints: [String: [String: String]] = [:]
+		var recursiveConstraints: [String: [String: Term]] = [:]
 		var threaded: Set<String> = []
-		func thread(_ name: String, _ columns: [String], _ constraints: [String: String]) throws {
+		func thread(_ name: String, _ columns: [String], _ constraints: [String: Term]) throws {
 			let rules = try fetchRules(for: name)
 			if rules.contains(where: { $0.isRecursive(for: name) }),
 				recursiveConstraints[name] == nil
@@ -68,8 +98,13 @@ extension RBDB {
 				}
 			}
 		}
-		let topConstraints = extractEqualityConstraints(
-			from: stmt, predicateName: topPredicate, columnNames: topColumns)
+		// The demand as the query stated it, where we have it; otherwise recovered from the statement
+		//  text, which is all a raw SQL statement leaves to go on.
+		let topConstraints =
+			demand?.predicate == topPredicate
+			? demand!.constraints
+			: extractEqualityConstraints(
+				from: stmt, predicateName: topPredicate, columnNames: topColumns)
 		try thread(topPredicate, topColumns, topConstraints)
 
 		// Build the SQL. `cteDefinitions`/`cteOrder` collect the self-recursive CTEs (emitted
@@ -131,22 +166,18 @@ extension RBDB {
 			}
 
 			for rule in rules {
-				let ruleSQL = try rule.ruleIntoSQL(getCols, tableSource: reference)
-				var finalSQL = ruleSQL
-				if rule.isRecursive(for: name),
-					let bounds = boundsForRecursiveStep(
-						rule: rule, predicateName: name, columnNames: columns,
-						constraints: recursiveConstraints[name] ?? [:])
-				{
-					// SQLite forbids referencing a recursive CTE from inside a subquery, so we can't
-					//  wrap the rule SQL — inject the bound conditions directly, extending the rule's
-					//  own WHERE clause (constants on its first literal, and any guards) when it has one.
-					let connector =
-						ruleSQL.range(of: " WHERE ", options: .caseInsensitive) != nil
-						? " AND " : " WHERE "
-					finalSQL = ruleSQL + connector + bounds.joined(separator: " AND ")
-				}
-				selects.append(finalSQL)
+				// SQLite forbids referencing a recursive CTE from inside a subquery, so a bounded step
+				//  can't be expressed by wrapping the rule's SQL. Bound the *rule* instead: a derived
+				//  bound is a guard like any the caller wrote, so it conjoins onto the body and the
+				//  existing lowering puts it in the same WHERE clause as the rule's own constraints.
+				let bounded =
+					rule.isRecursive(for: name)
+					? rule.adding(
+						guards: boundsForRecursiveStep(
+							rule: rule, predicateName: name, columnNames: columns,
+							constraints: recursiveConstraints[name] ?? [:]))
+					: rule
+				selects.append(try bounded.ruleIntoSQL(getCols, tableSource: reference))
 			}
 			return selects.joined(separator: separator)
 		}
@@ -199,27 +230,27 @@ extension RBDB {
 	/// expression case is what lets a query constrain a *computed* column (e.g. `square(X, 4)`, whose
 	/// `4 = X²` bounds `X ≤ 2` and hence `nat`'s recursion).
 	private func propagateConstraints(
-		_ constraints: [String: String],
+		_ constraints: [String: Term],
 		headColumns: [String],
 		head: Predicate,
 		toBody body: Predicate,
 		bodyColumns: [String]
-	) -> [String: String] {
-		var result: [String: String] = [:]
+	) -> [String: Term] {
+		var result: [String: Term] = [:]
 		for (headIdx, headArg) in head.arguments.enumerated() where headIdx < headColumns.count {
 			guard let literal = constraints[headColumns[headIdx]],
 				headArg.freeVariables.count == 1, let v = headArg.freeVariables.first
 			else { continue }
 
 			// The value `v` must take for this column to equal `literal`.
-			let value: String
+			let value: Term
 			if case .variable = headArg {
 				value = literal  // bare variable: pass the literal through unchanged
-			} else if let target = Double(literal),
+			} else if case .number(let target) = literal,
 				let solved = solve(headArg, for: v, equals: target),
 				solved.isFinite
 			{
-				value = String(solved)
+				value = .number(solved)
 			} else {
 				continue  // non-numeric literal or non-invertible expression
 			}
@@ -267,25 +298,24 @@ extension RBDB {
 		}
 	}
 
-	/// Returns SQL bounds (e.g. `[n] <= 100`) to add to a recursive rule's step, derived from the
+	/// Returns guards (e.g. `N + 1 <= 100`) to conjoin onto a recursive rule's step, derived from the
 	/// query's equality constraints and the head expression's monotonicity in the body variables.
-	/// Returns nil if no usable bound was found — the caller will leave the rule unconstrained.
+	/// Returns an empty array if no usable bound was found — the rule is then left unconstrained.
 	private func boundsForRecursiveStep(
 		rule: Formula,
 		predicateName: String,
 		columnNames: [String],
-		constraints: [String: String]
-	) -> [String]? {
+		constraints: [String: Term]
+	) -> [BooleanExpression] {
 		guard !constraints.isEmpty,
 			case .hornClause(let head, let bodies, _) = rule,
 			let recursiveBody = bodies.first(where: { $0.name == predicateName })
-		else { return nil }
+		else { return [] }
 
-		var bounds: [String] = []
+		var bounds: [BooleanExpression] = []
 		for (colIdx, headTerm) in head.arguments.enumerated()
 		where colIdx < columnNames.count && colIdx < recursiveBody.arguments.count {
-			let colName = columnNames[colIdx]
-			guard let bound = constraints[colName] else { continue }
+			guard let bound = constraints[columnNames[colIdx]] else { continue }
 
 			// Each recursion step maps this column from `bodyTerm` (the existing tuple) to `headTerm`
 			//  (the tuple being derived). For a one-sided bound to be sound both must be a monotonic
@@ -299,16 +329,21 @@ extension RBDB {
 				let direction = stepDirection(head: headTerm, body: bodyTerm, in: v)
 			else { continue }
 
-			if bound.hasPrefix("'") {
+			guard case .number = bound else {
 				// `stepDirection` succeeds only for numeric steps, so this recursion produces numbers
-				//  and can never equal a string target — prune the step. (A naive `[n] <= 'hi mom'`
-				//  never terminates, because SQLite orders every number before every string.)
-				bounds.append("0 <> 0")
-			} else {
-				bounds.append("[\(colName)] \(direction > 0 ? "<=" : ">=") \(bound)")
+				//  and can never equal a non-numeric target — prune the step. (A naive `N + 1 <= 'hi
+				//  mom'` never terminates, because SQLite orders every number before every string.)
+				bounds.append(.notEqual(.number(0), .number(0)))
+				continue
 			}
+			// The bound is on the value this step *derives*, which is the head term — the same thing
+			//  the column holds, said without depending on the column alias being in scope.
+			bounds.append(
+				direction > 0
+					? .lessThanOrEqual(headTerm, bound)
+					: .greaterThanOrEqual(headTerm, bound))
 		}
-		return bounds.isEmpty ? nil : bounds
+		return bounds
 	}
 
 	/// Direction the column drifts each recursion step: `+1` if the derived value (`head`) exceeds
@@ -331,11 +366,16 @@ extension RBDB {
 
 	/// Best-effort extraction of `[predicate].column = literal` style equality constraints from
 	/// the failing statement text. Handles the form generated by `queryIntoSQL` and common
-	/// hand-written variants. Returns map of column name → literal SQL expression.
+	/// hand-written variants. Returns map of column name → the ground term the column is pinned to.
+	///
+	/// The fallback, not the main path: a query written as a `Formula` states its demand outright (see
+	/// `Demand`), and only a statement that never was a formula — raw SQL typed at the CLI — has to
+	/// have it read back out of the text. Note that this can only see *literals*: a bound parameter or
+	/// a correlated column reference carries no demand here, so such a query stays unbounded.
 	private func extractEqualityConstraints(
 		from stmt: String, predicateName: String, columnNames: [String]
-	) -> [String: String] {
-		var result: [String: String] = [:]
+	) -> [String: Term] {
+		var result: [String: Term] = [:]
 		let escName = NSRegularExpression.escapedPattern(for: predicateName)
 		for col in columnNames {
 			let escCol = NSRegularExpression.escapedPattern(for: col)
@@ -346,8 +386,21 @@ extension RBDB {
 					in: stmt, range: NSRange(stmt.startIndex..., in: stmt)),
 				let valueRange = Range(match.range(at: 1), in: stmt)
 			else { continue }
-			result[col] = String(stmt[valueRange])
+			result[col] = term(fromSQLLiteral: String(stmt[valueRange]))
 		}
 		return result
+	}
+
+	/// The term a SQL literal denotes, for the forms the pattern above admits. Nil for anything else,
+	/// which pins nothing rather than pinning a value we couldn't read.
+	private func term(fromSQLLiteral literal: String) -> Term? {
+		if literal.hasPrefix("'") {
+			return .string(String(literal.dropFirst().dropLast()))
+		}
+		switch literal.lowercased() {
+		case "true": return .boolean(true)
+		case "false": return .boolean(false)
+		default: return Double(literal).map(Term.number)
+		}
 	}
 }

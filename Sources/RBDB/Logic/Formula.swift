@@ -32,6 +32,18 @@ public enum Formula: Symbol {
 			return negatives.contains { $0.name == predicateName }
 		}
 	}
+
+	/// This clause with further guards conjoined to its body. Used to constrain a rule *before* it is
+	/// lowered — a derived bound is a filter on the rule like any the caller wrote, so it belongs in the
+	/// clause rather than being concatenated onto the SQL the clause produced.
+	public func adding(guards additional: [BooleanExpression]) -> Formula {
+		guard !additional.isEmpty else { return self }
+		switch self {
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
+			return .hornClause(
+				positive: positive, negative: negatives, guards: guards + additional)
+		}
+	}
 }
 
 extension SymbolRewriter {

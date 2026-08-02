@@ -10,6 +10,16 @@ public enum CoherenceError: Error {
 	///   to resolve the contradiction. Empty if the contradicting formula is not derived from anything retractable.
 	///   `nil` if that information is not available.
 	case contradiction(contradicts: Formula, derivedFrom: [Formula]?)
+
+	/// Coherence could not be decided for `relation`, so the write was refused.
+	///
+	/// This can occur with a *value-generating* rule on both polarities of a predicate. With `p` and `-p` each
+	/// able to escape the finite active domain, neither can be enumerated to bound the other. The write that would
+	/// leave a relation in that state gets refused.
+	///
+	/// - Parameter relation: The relation, named positively (`p`, never `-p`), whose two polarities
+	///   could not be compared.
+	case undecidable(relation: String)
 }
 
 // Coherence for strong negation: `p(…)` and `-p(…)` are different claims about the same arguments, and
@@ -58,44 +68,70 @@ extension RBDB {
 		isCheckingCoherence = true
 		defer { isCheckingCoherence = false }
 
-		// FIXME: One `INTERSECT` per candidate is the unoptimized form. The lever, when it matters, is to
-		//  skip a candidate whose `dependencyCone` doesn't contain what was just written — nothing else
-		//  can have changed what that candidate derives.
 		let asserted = formula?.canonicalize()
+		// The relation this write landed in, where the caller named it. What a candidate derives is a
+		//  function of its dependency cone, so a write outside both of a candidate's cones cannot have
+		//  changed either side of it — and it was coherent before, or this check would not have let the
+		//  previous write stand. Such a candidate is skipped without either side being read.
+		//
+		//  Only the `assert` path can say. A raw SQL statement arrives here already executed and
+		//  unparsed, so `formula` is nil and every candidate is compared, as before.
+		let written: String? =
+			switch asserted {
+			case .hornClause(let head, _, _): head.name
+			case nil: nil
+			}
 		// The best answer found so far in a relation where *nothing* is retractable. Held rather than
 		//  thrown, because a later candidate may yet offer one that is — see below.
 		var unactionable: Formula? = nil
+		// The first relation the check couldn't decide. Held for the same reason and one more: it is the
+		//  weakest answer there is — it says only that the engine can't tell — so any *definite*
+		//  contradiction found later outranks it.
+		var undecidable: String? = nil
 
 		for positiveName in try possiblyContradictingNegativelyKnownRelations() {
-			guard let columns = try getColumns(for: positiveName),
-				let contradicting = try contradictingLiterals(of: positiveName, columns: columns)
-			else {
-				// This relation is coherent (or undeclared)
+			guard let columns = try getColumns(for: positiveName) else {
+				continue  // undeclared
+			}
+
+			// Both cones are needed anyway — they are what says whether either side can be enumerated —
+			//  so they are taken here, once, and answer the reachability question on the way past.
+			let cones = (
+				positive: try dependencyCone(of: positiveName),
+				negative: try dependencyCone(of: "-\(positiveName)")
+			)
+			if let written, !cones.positive.contains(written), !cones.negative.contains(written) {
 				continue
+			}
+
+			let contradicting: [Literal]
+			switch try verdict(for: positiveName, columns: columns, cones: cones) {
+			case .coherent: continue
+			case .undecidable:
+				undecidable = undecidable ?? positiveName
+				continue
+			case .contradicting(let literals): contradicting = literals
 			}
 
 			// Which of the two to name. Never the formula being asserted: that one is the newcomer, not
 			//  the culprit, and citing it would tell the caller to retract what they just asked for.
-			//  Among what's left, prefer a live stored row, since that is the one they *can* retract —
-			//  where the contradiction is completed through some third relation neither side is the
-			//  newcomer, and the stored side is exactly the useful answer.
+			//  Among what's left, prefer a live stored row, since that is the one they *can* retract.
 			let eligible = contradicting.filter { $0.formula != asserted }
 			let stored = try eligible.filter(isStored).map(\.formula)
 			if let culprit = stored.first {
 				throw CoherenceError.contradiction(contradicts: culprit, derivedFrom: stored)
 			}
 
-			// Both sides here are derived, so there is nothing to hand back to `retract`. That answer is
-			//  honest but close to useless — and actively confusing, since undoing the write also makes
-			//  the cited literal unqueryable, so the caller is told about a "known value" they can then
-			//  find no trace of. One write can break several relations at once (these rules propagate a
-			//  collision across every relation that mentions either polarity), so keep scanning: another
-			//  candidate may contradict through a stored row, which is the one they can act on.
+			// Both sides here are derived, so there is nothing to hand back to `retract`.
+			//  Hold on to it, but keep scanning in case we find a more useful contradiction.
 			unactionable = unactionable ?? eligible.first?.formula
 		}
 
 		if let unactionable {
 			throw CoherenceError.contradiction(contradicts: unactionable, derivedFrom: nil)
+		}
+		if let undecidable {
+			throw CoherenceError.undecidable(relation: undecidable)
 		}
 	}
 
@@ -129,13 +165,56 @@ extension RBDB {
 	/// doesn't have to re-encode it.
 	private typealias Literal = (formula: Formula, json: String)
 
-	/// A ground literal of `name` that holds in both polarities, given in each polarity — or nil where
-	/// the relation is coherent.
+	/// What the check could establish about one relation.
+	private enum Verdict {
+		/// No ground literal of this relation holds in both polarities.
+		case coherent
+
+		/// One that does, given in each polarity.
+		case contradicting([Literal])
+
+		/// Neither polarity could be compared against the other, so nothing is claimed either way.
+		case undecidable
+	}
+
+	/// Whether some ground literal of `name` holds in both polarities.
 	///
-	/// Asks the two *relations*, not `_rule`: a view is `baseFactsSelect UNION rules`, so intersecting
-	/// them covers stored and derived rows alike. `INTERSECT` compares every column, which is exactly
-	/// "some ground literal holds in both polarities".
-	private func contradictingLiterals(of name: String, columns: [String]) throws -> [Literal]? {
+	/// Two ways to ask, chosen by whether each side is finite. `INTERSECT` reads both relations end to
+	/// end, so it is only available where both of them end: a *value-generating* side (arithmetic under
+	/// recursion) streams out of a `WITH RECURSIVE` CTE with nothing to stop it, and the scan never
+	/// finishes. Where exactly one side is finite, the question is asked the other way round — see
+	/// `probingLiterals`.
+	///
+	/// - Parameter cones: The two sides' dependency cones, which the caller holds already. Whether a
+	///   side is finite is a property of its cone, so nothing here has to walk the rule graph again.
+	private func verdict(
+		for name: String, columns: [String], cones: (positive: Set<String>, negative: Set<String>)
+	) throws -> Verdict {
+		func verdict(_ literals: [Literal]?) -> Verdict {
+			literals.map(Verdict.contradicting) ?? .coherent
+		}
+		switch (try isFinite(cone: cones.positive), try isFinite(cone: cones.negative)) {
+		case (true, true):
+			return verdict(try intersectingLiterals(of: name, columns: columns))
+		case (true, false):
+			return verdict(try probingLiterals(enumerating: name, columns: columns))
+		case (false, true):
+			return verdict(try probingLiterals(enumerating: "-\(name)", columns: columns))
+		case (false, false):
+			// Both sides value-generating: neither can be enumerated, so there is no ground literal to
+			//  probe the other with, and deciding it in general is deciding whether two Datalog-with-
+			//  arithmetic relations intersect. Closing this properly needs symbolic reasoning over the
+			//  two sides' rule heads rather than a query against either; until then the caller is told,
+			//  and the write that would leave the relation this way is refused.
+			return .undecidable
+		}
+	}
+
+	/// The both-finite form: ask the two *relations*, not `_rule`, since a view is
+	/// `baseFactsSelect UNION rules` and so intersecting them covers stored and derived rows alike.
+	/// `INTERSECT` compares every column, which is exactly "some ground literal holds in both
+	/// polarities".
+	private func intersectingLiterals(of name: String, columns: [String]) throws -> [Literal]? {
 		let columnList = columns.map { "[\($0)]" }.joined(separator: ", ")
 		let intersect = SQL(
 			"""
@@ -150,14 +229,54 @@ extension RBDB {
 			""", arguments: [name, "-\(name)"])
 		guard let row = try query(sql: intersect).makeIterator().next() else { return nil }
 
-		func literal(_ key: String) throws -> Literal {
-			guard let json = row[key] as? String, let data = json.data(using: .utf8) else {
-				throw RBDBError.corruptData(
-					message: "predicate_formula did not return valid UTF-8 JSON")
-			}
-			return Literal(formula: try JSONDecoder().decode(Formula.self, from: data), json: json)
+		return [try literal(row, "positive"), try literal(row, "negative")]
+	}
+
+	/// The one-side-infinite form: enumerate the finite side and ask about each of its literals
+	/// individually, rather than scanning the infinite one.
+	///
+	/// The switch is what makes the question answerable. A contradiction is always some *ground*
+	/// literal, so where one polarity is finite, every candidate contradiction is one of the finitely
+	/// many literals it holds — and asking the other polarity about a ground literal is a query with its
+	/// arguments bound, which `RecursiveClosure` turns into a bound on the recursive step. `nat(99)`
+	/// terminates for the same reason a user's `nat(99)` does, where `SELECT … FROM [nat]` does not.
+	///
+	/// Asking it as a *correlated* `EXISTS` over the finite side (`WHERE EXISTS (SELECT 1 FROM [nat]
+	/// WHERE [nat].n = f.n)`) does not work and is not merely unimplemented: the constraint is then a
+	/// column reference rather than a literal, and a recursive CTE is evaluated once, outside the
+	/// correlation, so there is no per-row bound to inject. Ground literals, one at a time, is the form
+	/// that carries a bound.
+	private func probingLiterals(enumerating name: String, columns: [String]) throws -> [Literal]? {
+		let columnList = columns.map { "[\($0)]" }.joined(separator: ", ")
+		let enumerated = SQL(
+			"SELECT predicate_formula(?, \(columnList)) AS known FROM [\(name)]",
+			arguments: [name])
+
+		for row in try query(sql: enumerated) {
+			let known = try literal(row, "known")
+			guard case .hornClause(let head, _, _) = known.formula else { continue }
+
+			// The same arguments in the other polarity. Built as a `Formula` and asked through
+			//  `query(formula:)` so the arguments lower to SQL *literals* — a bound parameter would be
+			//  invisible to the bound derivation, and the probe would be the unbounded scan again.
+			let probe = Formula.predicate(
+				Predicate(name: head.inverse.name, arguments: head.arguments))
+			guard try query(formula: probe).hasMoreRows else { continue }
+
+			let derived = Literal(formula: probe, json: try formulaToJSON(probe))
+			// Callers expect the pair positive-first.
+			return head.isNegated ? [derived, known] : [known, derived]
 		}
-		return [try literal("positive"), try literal("negative")]
+		return nil
+	}
+
+	/// Decodes a `predicate_formula` column into a `Literal`.
+	private func literal(_ row: Row, _ key: String) throws -> Literal {
+		guard let json = row[key] as? String, let data = json.data(using: .utf8) else {
+			throw RBDBError.corruptData(
+				message: "predicate_formula did not return valid UTF-8 JSON")
+		}
+		return Literal(formula: try JSONDecoder().decode(Formula.self, from: data), json: json)
 	}
 
 	/// Whether this literal is itself a live row of `_rule` — something someone asserted, as opposed to a

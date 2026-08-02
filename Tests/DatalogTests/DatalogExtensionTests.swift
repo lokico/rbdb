@@ -285,6 +285,49 @@ struct DatalogExtensionTests {
 		#expect(Array(try db.query(datalog: "nat('hi mom')")).isEmpty)
 	}
 
+	/// A predicate reached only through a `WITH RECURSIVE` prefix cannot be reached from inside a view:
+	/// SQLite compiles a view's body in its own scope, so the CTE is invisible there. `p`'s view is
+	/// built here while everything is still finite, and the rule asserted afterwards makes its
+	/// dependency value-generating — which leaves that view unusable, and used to surface as a
+	/// `near "WITH": syntax error` when the rescue prefixed a second CTE onto an already-prefixed
+	/// statement.
+	@Test("a dependent's view is reclaimed when its dependency turns value-generating")
+	func dependentOfFlippedRelation() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE a(n)")
+		try db.query(sql: "CREATE TABLE p(m)")
+		try db.assert(datalog: "a(0)")
+		try db.assert(datalog: "p(X) :- a(X)")
+
+		// Queried while everything is finite: `p` gets a plain temp view over `a`'s view.
+		#expect(try db.query(datalog: "p(0)").map { _ in 1 }.count == 1)
+
+		// Now `a` can escape the finite domain, so it is reachable only through a CTE — and `p` with it.
+		try db.assert(datalog: "a(X + 1) :- a(X)")
+		#expect(try db.query(datalog: "p(1)").map { _ in 1 }.count == 1, "1 is reachable from 0")
+		#expect(try db.query(datalog: "p(1.5)").map { _ in 1 }.isEmpty, "1.5 is not")
+	}
+
+	/// A query written as a `Formula` states its demand outright, and that is how the bound reaches the
+	/// recursive step for every other test here. Raw SQL never was a formula, so there is nothing to
+	/// state it — the bound has to be read back out of the statement text, and this is the only thing
+	/// that recovery path exists for. Without it this query does not terminate.
+	@Test("a bounded raw SQL query against a value-generating relation terminates")
+	func rawSQLBoundedQuery() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE nat(n)")
+		try db.assert(datalog: "nat(0)")
+		try db.assert(datalog: "nat(N + 1) :- nat(N)")
+
+		// Unbracketed, as it would be typed at the CLI.
+		let rows = Array(try db.query(sql: "SELECT n FROM nat WHERE nat.n = 5"))
+		#expect(rows.count == 1, "5 is a nat")
+
+		// And bracketed, as `queryIntoSQL` writes it.
+		let bracketed = Array(try db.query(sql: "SELECT [n] FROM [nat] WHERE [nat].[n] = 6"))
+		#expect(bracketed.count == 1, "6 is a nat")
+	}
+
 	@Test("recursive countdown with arithmetic in the body")
 	func recursiveBodyArithmeticDown() async throws {
 		let db = try RBDB(path: ":memory:")

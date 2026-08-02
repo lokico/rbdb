@@ -718,6 +718,17 @@ arrival order). The CWA axiom end-to-end still belongs to PLAN-EVENTS Phase 2, s
 - **The scan is unoptimized** — one `INTERSECT` per candidate relation per write. The candidate
   set is usually empty (one indexed probe), and the lever when it is not is to skip a candidate
   whose `dependencyCone` does not contain what was just written.
+- **A candidate with two value-generating sides is refused, not checked.** `INTERSECT` needs both
+  relations to end; where exactly one is value-generating the check enumerates the finite side
+  and probes the other with *ground* literals instead (bound arguments are what let
+  `RecursiveClosure` bound the recursion). Where both sides are value-generating there is no
+  finite side to enumerate, and deciding it means deciding whether two Datalog-with-arithmetic
+  relations intersect. Rather than accept such writes unchecked, the write that would leave a
+  relation in that state throws `CoherenceError.undecidable` — a database that is decidable stays
+  decidable, and retracting either side's value-generating rule lets the write through. It is the
+  weakest answer the scan has, so a definite contradiction found in any other relation outranks
+  it. Deciding these pairs rather than refusing them needs symbolic reasoning over the two sides'
+  rule heads, not a query against either.
 - **No group retraction** — retracting a whole scenario at once is PLAN-EVENTS §4.2's
   `group_name`, unchanged by this plan and still pending.
 - **"Unknown" is not surfaced as an answer value.** The three-valued *semantics* is here

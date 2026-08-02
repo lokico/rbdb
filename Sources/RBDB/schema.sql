@@ -82,6 +82,12 @@ DROP TRIGGER IF EXISTS _drop_temp_view_on_rule_insert;
 -- Trigger is temp so it can access temp.sqlite_schema (bypassing same-DB restriction for non-temp triggers)
 -- FIXME: Take a close look at using `main.` below whenever we support attaching other DBs
 -- (used as recommended by https://www.sqlite.org/lang_createtrigger.html#temp_triggers_on_non_temp_tables)
+-- Note the scope: `main._rule` is shared, but a trigger program is compiled into the statement that
+--  fires it, so this runs only on the connection performing the write — every connection creating its
+--  own copy does not change that. A rule asserted on another connection would therefore leave this
+--  one's views and closures standing, answering from the rule set they were built against. That is
+--  precisely why a database serves one connection at a time (`RBDB.claimExclusively`): this
+--  invalidation is only sound when there is nothing else to invalidate.
 CREATE TEMP TRIGGER IF NOT EXISTS _invalidate_on_rule_insert
 AFTER INSERT ON main._rule
 BEGIN

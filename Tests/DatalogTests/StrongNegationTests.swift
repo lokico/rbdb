@@ -5,41 +5,28 @@ import Testing
 @testable import Datalog
 @testable import RBDB
 
-/// Runs `action` exactly once, from inside a connection's statement-trace callback, the first time that
-/// connection begins a statement whose SQL starts with `prefix`.
+/// Aborts any statement on a connection that runs longer than a fixed budget of VM instructions.
 ///
-/// This is how a cross-connection race is reproduced *deterministically*: the callback fires on the
-/// hooked connection's own thread, between its statements, so the second connection's work is placed at
-/// an exact point in the first one's sequence rather than being raced into it.
-private final class Interleave {
-	private let prefix: String
-	private let action: () -> Void
-	private(set) var fired = false
+/// This is how a *non-terminating* query is pinned by a test without stalling the suite: the runaway
+/// below otherwise churns for five minutes before dying of its own accord, which is far too slow to
+/// live in a test run. The budget is generous enough that no bounded statement in these tests comes
+/// near it, so tripping it means the work really was unbounded.
+private final class StepBudget {
+	private(set) var exhausted = false
 
-	init(firingOn prefix: String, _ action: @escaping () -> Void) {
-		self.prefix = prefix
-		self.action = action
-	}
-
-	func install(on db: RBDB) {
-		sqlite3_trace_v2(
-			db.db, UInt32(SQLITE_TRACE_STMT),
-			{ _, context, statement, _ in
-				guard let context, let statement else { return 0 }
-				let box = Unmanaged<Interleave>.fromOpaque(context).takeUnretainedValue()
-				guard !box.fired,
-					let sql = sqlite3_sql(OpaquePointer(statement)),
-					String(cString: sql).hasPrefix(box.prefix)
-				else { return 0 }
-				// Set before running, so anything the action does can't re-enter this.
-				box.fired = true
-				box.action()
-				return 0
+	func install(on db: RBDB, opcodes: Int32) {
+		sqlite3_progress_handler(
+			db.db, opcodes,
+			{ context in
+				guard let context else { return 0 }
+				let box = Unmanaged<StepBudget>.fromOpaque(context).takeUnretainedValue()
+				box.exhausted = true
+				return 1  // non-zero interrupts the running statement
 			}, Unmanaged.passUnretained(self).toOpaque())
 	}
 
 	func uninstall(on db: RBDB) {
-		sqlite3_trace_v2(db.db, 0, nil, nil)
+		sqlite3_progress_handler(db.db, 0, nil, nil)
 	}
 }
 
@@ -269,10 +256,11 @@ struct StrongNegationTests {
 		#expect(try !believesBoth(db), "p(1) and -p(1) must not both be derivable")
 	}
 
-	/// The scan visits every relation with a live negative side, and a *coherent* one must not end it.
-	/// Two relations are known-negative here and only one of them contradicts, so whichever the scan
-	/// reaches first, it has to keep going — the parameter puts the clean candidate first in one case and
-	/// second in the other, so neither enumeration order can pass by accident.
+	/// The scan considers every relation with a live negative side, and one it passes over — whether
+	/// because the write cannot reach it or because it is coherent — must not end it. Two relations are
+	/// known-negative here and only one of them contradicts, so whichever the scan reaches first, it has
+	/// to keep going — the parameter puts the clean candidate first in one case and second in the other,
+	/// so neither enumeration order can pass by accident.
 	@Test(
 		"a coherent candidate does not abandon the scan",
 		arguments: ["a", "z"])
@@ -436,57 +424,40 @@ struct StrongNegationTests {
 		#expect(try db.query(datalog: "-p(A)").map { Int($0["A"] as! Int64) } == [1])
 	}
 
-	/// The two points in `assert` at which a second connection could still cut in, and they are not
-	/// interchangeable:
+	/// A second connection cannot slip a fact past this one's coherence check, because there is no
+	/// second connection: a database serves one at a time, and the second `init` is refused.
 	///
-	/// - `BEGIN` fires before the transaction holds any lock. This is the one with teeth: it is exactly
-	///   the window a coherence check performed *outside* the transaction leaves open, and moving the
-	///   check back out there fails this case (and only this case).
-	/// - The first write fires once the transaction is under way and holding its lock, so it covers the
-	///   later window — the interloper should now be refused rather than merely losing.
-	static let interleavingPoints = ["BEGIN", "SELECT", "INSERT INTO _entity ("]
-
-	@Test(
-		"two connections cannot both slip a fact past the other's coherence check",
-		arguments: interleavingPoints)
-	func concurrentContradiction(_ interleavingPoint: String) async throws {
-		let path = NSTemporaryDirectory() + "rbdb-race-\(UUID().uuidString).db"
+	/// This replaces an interleaving test that drove two connections through each other's `assert` at
+	/// three chosen points. What that test established — that the check inside the transaction closes
+	/// the window an outside-the-transaction check would leave open — is no longer the property that
+	/// carries the guarantee, and its scenario can no longer be built at all. The reason for the
+	/// restriction is broader than the race it covered: what one connection believes is partly held in
+	/// *its* temp views and closures, so a second one can reason from a rule set the checking
+	/// connection cannot see.
+	@Test("a second connection on the same database is refused")
+	func secondConnectionRefused() async throws {
+		let path = NSTemporaryDirectory() + "rbdb-single-\(UUID().uuidString).db"
 		defer { try? FileManager.default.removeItem(atPath: path) }
 
-		let db1 = try RBDB(path: path)
-		try db1.query(sql: "CREATE TABLE p(a)")
-		let db2 = try RBDB(path: path)
+		var first: RBDB? = try RBDB(path: path)
+		try first!.query(sql: "CREATE TABLE p(a)")
+		try first!.assert(datalog: "p(1)")
 
-		// Let db2 run its whole contradicting assert from inside db1's own statement sequence. No
-		//  threads: the interleaving is exact rather than raced.
-		var db2Error: (any Error)?
-		let interleave = Interleave(firingOn: interleavingPoint) {
-			do { try db2.assert(datalog: "-p(1)") } catch { db2Error = error }
+		#expect(throws: RBDBError.self) {
+			_ = try RBDB(path: path)
 		}
-		interleave.install(on: db1)
-		defer { interleave.uninstall(on: db1) }
 
-		var db1Error: (any Error)?
-		do { try db1.assert(datalog: "p(1)") } catch { db1Error = error }
+		// Releasing the first connection hands the database on: the restriction is one connection at a
+		//  time, not one ever.
+		first = nil
+		let second = try RBDB(path: path)
+		#expect(try second.query(datalog: "p(A)").map { Int($0["A"] as! Int64) } == [1])
 
-		#expect(interleave.fired, "the interleaving must actually have happened")
-
-		// Which connection wins depends on where the other cut in — db2 slipping in ahead of db1's lock
-		//  loses db1 the race, and vice versa — and either is a fine answer. What must not happen is
-		//  *both* succeeding: the loser has to be told, whether by `SQLITE_BUSY` or by `.contradiction`.
-		let losers = [db1Error, db2Error].compactMap { $0 }
-		#expect(losers.count == 1, "exactly one assert must be refused, got \(losers)")
-
-		let live = Set(
-			try db1.query(
-				sql: """
-					SELECT output_type FROM _rule
-					WHERE superceded_by IS NULL AND negative_literal_count = 0
-					"""
-			).map { $0["output_type"] as! String })
-		#expect(
-			live == (db1Error == nil ? ["@p"] : ["@-p"]),
-			"exactly the winner's fact is believed — never both p(1) and -p(1)")
+		// And it holds for a database that already carries the schema, where opening writes nothing and
+		//  a lock taken only on demand would be a shared one that a second reader could join.
+		#expect(throws: RBDBError.self) {
+			_ = try RBDB(path: path)
+		}
 	}
 
 	@Test("a fact with no live rows of the complementary polarity skips the inverse query")
@@ -500,6 +471,180 @@ struct StrongNegationTests {
 		let negativeViews = Array(
 			try db.query(sql: "SELECT COUNT(*) AS n FROM temp.sqlite_schema WHERE name = '-p'"))
 		#expect(negativeViews.first?["n"] as? Int64 == 0)
+	}
+
+	/// A candidate is only worth comparing if this write could have changed what it derives, which is to
+	/// say if the written relation is somewhere in one of its two dependency cones. `-a(1)` makes `a` a
+	/// candidate for every later write; writing an unrelated `q` must not re-ask about it.
+	///
+	/// Whether the check looked is visible in whether it forced `a`'s relations into existence, which is
+	/// why this starts from a fresh connection: the setup's own writes build those views, and a fresh
+	/// connection has none. The parameter puts `q` inside the cone in one case and outside it in the
+	/// other, so the skip has to be reached by reachability rather than by never looking at all.
+	@Test(
+		"a write that cannot reach a candidate does not compare it", arguments: [false, true])
+	func coherenceSkipsUnreachableCandidate(_ reachable: Bool) async throws {
+		let path = NSTemporaryDirectory() + "rbdb-cone-\(UUID().uuidString).db"
+		defer { try? FileManager.default.removeItem(atPath: path) }
+
+		do {
+			let setup = try RBDB(path: path)
+			try setup.query(sql: "CREATE TABLE a(x)")
+			try setup.query(sql: "CREATE TABLE q(x)")
+			try setup.assert(datalog: "-a(1)")
+			if reachable { try setup.assert(datalog: "a(X) :- q(X)") }
+		}
+
+		let db = try RBDB(path: path)
+		try db.assert(datalog: "q(2)")
+
+		let touched = Set(
+			try db.query(sql: "SELECT name FROM temp.sqlite_schema")
+				.compactMap { $0["name"] as? String })
+		#expect(
+			touched.contains("a") == reachable,
+			"`a` was \(reachable ? "not " : "")compared: \(touched.sorted())")
+		#expect(touched.contains("-a") == reachable)
+
+		// Either way the answer is the same, and still correct: `a(2)` is derivable in the reachable
+		//  case and collides with nothing, since what is known false is `a(1)`.
+		#expect(try db.query(datalog: "-a(A)").map { Int($0["A"] as! Int64) } == [1])
+	}
+
+	/// `[p] INTERSECT [-p]` reads both relations end to end, which is only an option where both of them
+	/// end. A *value-generating* side — arithmetic under recursion, so it streams out of a `WITH
+	/// RECURSIVE` CTE rather than being materialized — has no bound, and the scan used to churn for ~5
+	/// minutes before dying with a misleading `cannot rollback - no transaction is active` (`assert`'s
+	/// own `ROLLBACK`, firing after SQLite had already abandoned the transaction).
+	///
+	/// The question is now asked from the finite side instead: a contradiction is always some *ground*
+	/// literal, so the finitely many literals the finite polarity holds are the complete candidate set,
+	/// and each is put to the other polarity as a query with its arguments bound — which is exactly what
+	/// `RecursiveClosure` can bound the recursion with. Both answers have to be reachable, so this
+	/// checks a value that *is* derivable (the contradiction must be found, not merely survived) and one
+	/// that is not (the clean answer must be reached by bounding the recursion, not by giving up on it).
+	///
+	/// Only the asserts below are bounded: they are the ones that make `nat` a coherence candidate, and
+	/// so the only ones that go near it.
+	@Test("the coherence check terminates against a value-generating relation")
+	func coherenceAgainstValueGeneratingRelation() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE nat(n)")
+		try db.assert(datalog: "nat(0)")
+		try db.assert(datalog: "nat(X + 1) :- nat(X)")
+
+		let budget = StepBudget()
+		budget.install(on: db, opcodes: 5_000_000)
+		defer { budget.uninstall(on: db) }
+
+		#expect(throws: CoherenceError.self) {
+			try db.assert(datalog: "-nat(99)")
+		}
+		#expect(!budget.exhausted, "the check did not terminate on the derivable value")
+
+		// `99.5` is not reachable from `0` by `+1`, so nothing collides and the assert stands.
+		try db.assert(datalog: "-nat(99.5)")
+		#expect(!budget.exhausted, "the check did not terminate on the underivable value")
+		#expect(try db.query(datalog: "-nat(A)").map { $0["A"] as! Double } == [99.5])
+	}
+
+	/// The same, entered from the other side: here the *negative* relation is the value-generating one
+	/// and `nat` is a lone ground fact, so it is the positive side that has to be enumerated and the
+	/// negative side probed. Nothing about the check may be keyed to polarity.
+	@Test("the check terminates where it is the negative side that is value-generating")
+	func coherenceAgainstValueGeneratingNegativeRelation() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE nat(n)")
+		try db.assert(datalog: "-nat(0)")
+		try db.assert(datalog: "-nat(X + 1) :- -nat(X)")
+
+		let budget = StepBudget()
+		budget.install(on: db, opcodes: 5_000_000)
+		defer { budget.uninstall(on: db) }
+
+		#expect(throws: CoherenceError.self) {
+			try db.assert(datalog: "nat(99)")
+		}
+		#expect(!budget.exhausted, "the check did not terminate on the derivable value")
+
+		try db.assert(datalog: "nat(99.5)")
+		#expect(!budget.exhausted, "the check did not terminate on the underivable value")
+	}
+
+	/// **The remaining gap, pinned.** Where *both* polarities are value-generating there is no finite
+	/// side to enumerate and so no ground literal to probe with, and deciding it in general means
+	/// deciding whether two Datalog-with-arithmetic relations intersect. Rather than accept such writes
+	/// unchecked — which would let `nat(50)` and `-nat(50)` both become derivable with nothing said —
+	/// the engine declines to *enter* that state: the write that would make the second polarity
+	/// value-generating is refused, and the refusal names the relation it could no longer decide.
+	///
+	/// Neither order can slip through, so the parameter asserts the two rules the other way round. The
+	/// first of them is always fine on arrival — one value-generating side is still decidable.
+	@Test(
+		"a write that would leave both polarities value-generating is refused",
+		arguments: [true, false])
+	func coherenceBetweenTwoValueGeneratingRelations(_ positiveFirst: Bool) async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE nat(n)")
+		try db.assert(datalog: "nat(0)")
+
+		let steps =
+			positiveFirst
+			? ["nat(X + 1) :- nat(X)", "-nat(X + 1) :- -nat(X)"]
+			: ["-nat(X + 1) :- -nat(X)", "nat(X + 1) :- nat(X)"]
+		try db.assert(datalog: steps[0])
+
+		let budget = StepBudget()
+		budget.install(on: db, opcodes: 5_000_000)
+		defer { budget.uninstall(on: db) }
+
+		let error = #expect(throws: CoherenceError.self) {
+			try db.assert(datalog: steps[1])
+		}
+		#expect(!budget.exhausted, "the refusal must be reached without scanning either side")
+		guard case .undecidable(let relation) = error else {
+			Issue.record("expected `.undecidable`, got \(String(describing: error))")
+			return
+		}
+		#expect(relation == "nat")
+
+		// The refused rule was rolled back, and the connection is still usable — including for the
+		//  check, which is decidable again now that only one side generates values.
+		#expect(try db.fetchRules(for: steps[1].hasPrefix("-") ? "-nat" : "nat").isEmpty)
+		try db.assert(datalog: "-nat(99.5)")
+	}
+
+	/// An undecidable pair is the *weakest* answer the scan can give: it says only that the engine
+	/// cannot tell. A definite contradiction found in some other relation is a fact about the write, so
+	/// it must be the one reported — reaching an undecidable candidate can no more end the scan than
+	/// reaching a coherent one can.
+	///
+	/// `a` sorts before `p`, so the undecidable candidate is the one the scan meets first. The final
+	/// rule is refused twice over: it leaves `a`/`-a` both value-generating, *and* it makes `-a(1)`
+	/// derivable, which carries `p(1)` against the stored `-p(1)`.
+	@Test("a definite contradiction outranks an undecidable candidate")
+	func contradictionOutranksUndecidable() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE a(n)")
+		try db.query(sql: "CREATE TABLE p(m)")
+		try db.assert(datalog: "-a(0)")
+		try db.assert(datalog: "a(X + 1) :- a(X)")
+		try db.assert(datalog: "p(X) :- -a(X)")
+		try db.assert(datalog: "-p(1)")
+
+		let budget = StepBudget()
+		budget.install(on: db, opcodes: 5_000_000)
+		defer { budget.uninstall(on: db) }
+
+		let error = #expect(throws: CoherenceError.self) {
+			try db.assert(datalog: "-a(X + 1) :- -a(X)")
+		}
+		#expect(!budget.exhausted, "the check did not terminate")
+		guard case .contradiction(let contradicts, _) = error else {
+			Issue.record("expected `.contradiction`, got \(String(describing: error))")
+			return
+		}
+		#expect(contradicts == (try DatalogParser().parse("-p(1)")), "the stored culprit, not `a`")
 	}
 
 	// MARK: - §4.2.2 The SQL surface asks the same question
@@ -553,12 +698,16 @@ struct StrongNegationTests {
 	func sqlInsertRescuesInverseView() async throws {
 		let path = NSTemporaryDirectory() + "rbdb-neg-\(UUID().uuidString).db"
 		defer { try? FileManager.default.removeItem(atPath: path) }
-		let setup = try RBDB(path: path)
-		try setup.query(sql: "CREATE TABLE p(a)")
-		try setup.assert(datalog: "-p(1)")
+		do {
+			let setup = try RBDB(path: path)
+			try setup.query(sql: "CREATE TABLE p(a)")
+			try setup.assert(datalog: "-p(1)")
+		}
 
 		// A fresh connection: no temp views exist yet, so `[p]` and `[-p]` both have to be resolved by
 		//  `rescue` — from inside the check, after the write has landed — before the `INTERSECT` can run.
+		//  It has to be a *separate* connection rather than a second one, since a database serves one at
+		//  a time — see `secondConnectionRefused`.
 		let db = try RBDB(path: path)
 		#expect(throws: CoherenceError.self) {
 			try db.query(sql: "INSERT INTO p(a) VALUES (1)")

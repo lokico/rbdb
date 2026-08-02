@@ -15,8 +15,12 @@ extension RBDB {
 		while let name = stack.popLast() {
 			guard cone.insert(name).inserted else { continue }
 			for rule in try fetchRules(for: name) {
-				guard case .hornClause(_, let bodies, _) = rule else { continue }
-				for body in bodies { stack.append(body.name) }
+				switch rule {
+				case .hornClause(_, let bodies, _):
+					for body in bodies {
+						stack.append(body.name)
+					}
+				}
 			}
 		}
 		return cone
@@ -26,14 +30,20 @@ extension RBDB {
 	/// Arithmetic on a recursion-carrying predicate is the marker of a relation that can escape the
 	/// finite active domain (`nat`, `square`, `inc`) — such predicates must stream via the CTE.
 	private func valueGenerating(_ name: String) throws -> Bool {
-		try involvesRecursion(name) && fetchRules(for: name).contains { $0.doesArithmetic }
+		try involvesRecursion(name) && fetchRules(for: name).contains(where: \.doesArithmetic)
 	}
 
 	/// Whether the dependency cone of `predicate` is purely finite (relational) recursion — i.e. no
 	/// predicate in it is value-generating. Finite cones route to the iterative evaluator; a cone that
 	/// contains any value-generating predicate routes to the streaming CTE.
 	func coneIsFinite(_ predicate: String) throws -> Bool {
-		try !dependencyCone(of: predicate).contains(where: valueGenerating)
+		try isFinite(cone: dependencyCone(of: predicate))
+	}
+
+	/// The same question asked of a cone already in hand, for a caller that computed it for its own
+	/// reasons and would rather not walk the rule graph twice.
+	func isFinite(cone: Set<String>) throws -> Bool {
+		try !cone.contains(where: valueGenerating)
 	}
 
 	/// Builds — or, if the tables already exist, incrementally *extends* — the materialized closure of
