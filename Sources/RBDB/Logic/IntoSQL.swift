@@ -41,7 +41,14 @@ fileprivate struct SQLSelect {
 			result += " FROM \(t1.fromClause)"
 
 			for t2 in fromTables.dropFirst() {
-				result += " JOIN \(t2.fromClause) ON \(t2.conditions.joined(separator: " AND "))"
+				result += " JOIN \(t2.fromClause)"
+				// A body literal that shares no variable with any literal before it constrains
+				//  nothing, so there is no `ON` to write — the literals are joined on nothing, which
+				//  is exactly a cross product. (`JOIN … ON` with an empty condition isn't valid SQL,
+				//  and a bare `JOIN` is what SQLite spells that as, still free to be reordered.)
+				if !t2.conditions.isEmpty {
+					result += " ON \(t2.conditions.joined(separator: " AND "))"
+				}
 			}
 
 			whereConditions = t1.conditions + whereConditions

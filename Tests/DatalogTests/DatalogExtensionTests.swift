@@ -803,4 +803,55 @@ struct DatalogExtensionTests {
 		guard case .hornClause(_, let body, _) = generalFirst.canonicalize() else { return }
 		#expect(body.count == 1, "the surviving rule is the general one: \(body)")
 	}
+
+	@Test("a body literal sharing no variable with the preceding ones cross-joins")
+	func unjoinedBodyLiteralCrossJoins() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE letter(x)")
+		try db.query(sql: "CREATE TABLE digit(y)")
+		try db.query(sql: "CREATE TABLE pair(x, y)")
+
+		try db.assert(datalog: "letter('a')")
+		try db.assert(datalog: "letter('b')")
+		try db.assert(datalog: "digit(1)")
+		try db.assert(datalog: "digit(2)")
+
+		// `digit(Y)` shares no variable with `letter(X)`, so the two literals join on nothing at all —
+		//  the body is a cross product, and every pair is derivable.
+		try db.assert(datalog: "pair(X, Y) :- letter(X), digit(Y)")
+
+		let pairs = Array(try db.query(datalog: "pair(X, Y)"))
+			.compactMap { row -> String? in
+				guard let x = row["X"] as? String, let y = row["Y"] as? Int64 else { return nil }
+				return "\(x)\(y)"
+			}
+			.sorted()
+		#expect(pairs == ["a1", "a2", "b1", "b2"], "all four combinations: \(pairs)")
+	}
+
+	@Test("recursive rule whose body cross-joins is queryable")
+	func recursiveRuleWithCrossJoinedBody() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE parent(parent, child)")
+		try db.query(sql: "CREATE TABLE sibling(x, y)")
+		try db.query(sql: "CREATE TABLE cousin(x, y)")
+
+		for (p, c) in [("amy", "maeve"), ("laura", "mia"), ("sophie", "enda")] {
+			try db.assert(datalog: "parent('\(p)', '\(c)')")
+		}
+		try db.assert(datalog: "sibling('amy', 'laura')")
+
+		// `parent(D, B)` shares nothing with `parent(C, A)`; the two are tied together only by the
+		//  later `sibling(C, D)`. Plus the rule is recursive, so it is built as a `WITH RECURSIVE` CTE.
+		try db.assert(datalog: "cousin(A, B) :- cousin(B, A)")
+		try db.assert(datalog: "cousin(A, B) :- parent(C, A), parent(D, B), sibling(C, D), A != B")
+
+		let cousins = Array(try db.query(datalog: "cousin(A, B)"))
+			.compactMap { row -> String? in
+				guard let a = row["A"] as? String, let b = row["B"] as? String else { return nil }
+				return "\(a)-\(b)"
+			}
+			.sorted()
+		#expect(cousins == ["maeve-mia", "mia-maeve"], "cousins, symmetrically: \(cousins)")
+	}
 }
