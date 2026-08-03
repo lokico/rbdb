@@ -1,4 +1,4 @@
-public enum Term: Symbol, CustomDebugStringConvertible {
+public enum Term: Symbol, CustomStringConvertible {
 	case variable(Var)
 
 	// constants
@@ -17,13 +17,14 @@ public enum Term: Symbol, CustomDebugStringConvertible {
 		}
 	}
 
-	public var debugDescription: String {
+	/// Datalog-style surface syntax for this term.
+	public var description: String {
 		switch self {
 		case .variable(let v): v.description
 		case .boolean(let v): v ? "true" : "false"
 		case .number(let v): String(v)
 		case .string(let v): "\"\(v)\""
-		case .arithmetic(let expr): "(\(expr.debugDescription))"
+		case .arithmetic(let expr): "(\(expr))"
 		}
 	}
 

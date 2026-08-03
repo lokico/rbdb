@@ -1,18 +1,59 @@
 import Foundation
 import SQLite3
 
-public enum RBDBError: Error {
+// FIXME: Localize the strings in this file
+public enum RBDBError: LocalizedError {
 	case corruptData(message: String)
 
 	/// Another connection already has this database open. A database serves one connection at a time —
 	/// see ``RBDB/RBDB/init(path:)`` — so release the first one before opening a second.
 	case databaseInUse(path: String)
+
+	public var errorDescription: String? {
+		switch self {
+		case .corruptData(let message): "Corrupt data: \(message)"
+		case .databaseInUse(let path): "Database already in use: \(path)"
+		}
+	}
+
+	public var failureReason: String? {
+		switch self {
+		case .corruptData: nil
+		case .databaseInUse: "A database serves one connection at a time."
+		}
+	}
+
+	public var recoverySuggestion: String? {
+		switch self {
+		case .corruptData: nil
+		case .databaseInUse: "Release the connection that holds it, then open it again."
+		}
+	}
 }
 
-public enum RetractionError: Error {
+public enum RetractionError: LocalizedError {
 	/// No *live* `_rule` row has this canonical form. Note that a formula which is derivable but not
 	/// stored is `.notFound` too: retraction operates on the base, not the closure.
 	case notFound(Formula)
+
+	public var errorDescription: String? {
+		switch self {
+		case .notFound(let formula): "Nothing to retract: \(formula)"
+		}
+	}
+
+	public var failureReason: String? {
+		switch self {
+		case .notFound:
+			"Retraction operates on the base, not the closure: a formula that is derivable but was never asserted has no row to supersede."
+		}
+	}
+
+	public var recoverySuggestion: String? {
+		switch self {
+		case .notFound: "Retract what it follows from instead."
+		}
+	}
 }
 
 public class RBDB: SQLiteDatabase {

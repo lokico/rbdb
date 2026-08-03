@@ -1,4 +1,4 @@
-public protocol Expression: Codable, Comparable, CustomDebugStringConvertible, Sendable {
+public protocol Expression: Codable, Comparable, CustomStringConvertible, Sendable {
 	associatedtype Op: CodingKey, RawRepresentable where Op.RawValue: Comparable
 	var operation: Op { get }
 	var operands: [Term] { get }
@@ -14,12 +14,14 @@ package protocol ExpressionInternal: Expression {
 }
 
 extension Expression {
-	public var debugDescription: String {
+	/// The infix form the operands were written in: `X + 1`, `B != S`. An operator that isn't binary
+	/// has no infix form, so it falls back to naming itself.
+	public var description: String {
 		let operands = self.operands
 		if operands.count == 2 {
 			return "\(operands[0]) \(operation.rawValue) \(operands[1])"
 		} else {
-			return "\(operation)(\(operands.map(\.debugDescription).joined(separator: ", ")))"
+			return "\(operation)(\(operands.map(\.description).joined(separator: ", ")))"
 		}
 	}
 

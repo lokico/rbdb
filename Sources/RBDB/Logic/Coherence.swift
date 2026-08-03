@@ -1,7 +1,7 @@
 import Foundation
 import SQLite3
 
-public enum CoherenceError: Error {
+public enum CoherenceError: LocalizedError {
 	/// Some ground literal is derivable in **both** polarities, `p(t̄)` and `-p(t̄)` at once,
 	/// which is not allowed.
 	///
@@ -20,6 +20,37 @@ public enum CoherenceError: Error {
 	/// - Parameter relation: The relation, named positively (`p`, never `-p`), whose two polarities
 	///   could not be compared.
 	case undecidable(relation: String)
+
+	// FIXME: Localize these strings
+	public var errorDescription: String? {
+		switch self {
+		case .contradiction(let contradicts, _): "Contradicts known value: \(contradicts)"
+		case .undecidable(let relation):
+			"Could not decide whether '\(relation)' contradicts itself"
+		}
+	}
+
+	public var failureReason: String? {
+		switch self {
+		case .contradiction: nil
+		case .undecidable(let relation):
+			"Both polarities of '\(relation)' generate values, so neither can be enumerated to check the other against."
+		}
+	}
+
+	/// The retractions that resolve it, where there are any. A contradiction between two *derived*
+	/// literals has none to offer: what resolves it is retracting something further back, and which
+	/// that is is the caller's question to answer.
+	public var recoverySuggestion: String? {
+		switch self {
+		case .contradiction(_, let derivedFrom):
+			guard let derivedFrom, !derivedFrom.isEmpty else { return nil }
+			return "Retract one or more of: "
+				+ derivedFrom.map(\.description).joined(separator: ", ")
+		case .undecidable:
+			return nil
+		}
+	}
 }
 
 // Coherence for strong negation: `p(…)` and `-p(…)` are different claims about the same arguments, and

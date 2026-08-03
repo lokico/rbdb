@@ -705,27 +705,22 @@ func executeCommand(_ command: String, database: RBDB, mode: InputMode) {
 				}
 			}
 		}
-	} catch CoherenceError.contradiction(contradicts: let inverse, derivedFrom: let derivedFrom) {
-		let datalog = DatalogParser()
-		print("Error: Contradicts known value:")
-		print("    \((try? datalog.print(formula: inverse)) ?? String(describing: inverse)[...])")
-		if let derivedFrom = derivedFrom {
-			let retractions = derivedFrom.compactMap { try? datalog.print([.retract($0)]) }
-			if !retractions.isEmpty {
-				print("  Resolve with one or more of these retraction(s):")
-				for retraction in retractions {
-					print("    \(retraction)")
-				}
-			}
-		}
 	} catch {
-		if let locError = error as? LocalizedError {
-			print("Error: \(locError.errorDescription ?? String(describing: error))")
-			if let failureReason = locError.failureReason { print(failureReason) }
-			if let recoverSuggestion = locError.recoverySuggestion { print(recoverSuggestion) }
-		} else {
-			print("Error: \(error)")
-		}
+		for line in errorLines(error) { print(line) }
+	}
+}
+
+/// How an error is reported. Every error the engine raises describes itself, formulas and all — so
+/// there is nothing here that knows about any particular one.
+func errorLines(_ error: Error) -> [String] {
+	if let localized = error as? LocalizedError, let described = localized.errorDescription {
+		return ["Error: \(described)", localized.failureReason, localized.recoverySuggestion]
+			.compactMap { $0 }
+	} else {
+		// If it's not a `LocalizedError`, it probably came from the parsing library. It
+		//  leads with a severity of its own, which is dropped rather than printed under ours.
+		let described = String(describing: error)
+		return ["Error: \(described.trimmingPrefix("error: "))"]
 	}
 }
 

@@ -2,7 +2,7 @@ import Foundation
 import SQLite3
 
 /// Errors that can occur when working with SQLite databases.
-public enum SQLiteError: Error {
+public enum SQLiteError: LocalizedError {
 	/// Failed to open the database at the specified path.
 	case couldNotOpenDatabase(String)
 
@@ -20,6 +20,20 @@ public enum SQLiteError: Error {
 	///   - String: Error message from SQLite
 	///   - index: Position in the SQL where the error occurred, if available
 	case queryError(String, index: SQL.Index? = nil)
+
+	/// SQLite's own messages ("no such table: cousin") are already the whole explanation, so a query
+	/// error is reported as it stands rather than wrapped in one of ours. The index is for `rescue` to
+	/// resume from, not for a person to read.
+	public var errorDescription: String? {
+		// FIXME: Localize these strings
+		switch self {
+		case .couldNotOpenDatabase(let message): "Could not open database: \(message)"
+		case .couldNotRegisterFunction(let name): "Could not register SQL function '\(name)'"
+		case .queryParameterCount(let expected, let got):
+			"SQL has \(expected) parameter(s), but \(got) argument(s) were given"
+		case .queryError(let message, _): message
+		}
+	}
 }
 
 /// A Swift wrapper around SQLite with support for typed SQL queries and parameter binding.

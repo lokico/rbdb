@@ -1,11 +1,5 @@
-import RBDB
 import Parsing
-
-enum ParsingError: Error {
-	case conversionError
-	case expected(String)
-	case cannotPrintUnparseable(String)
-}
+import RBDB
 
 /// One formula plus what to do with it.
 ///

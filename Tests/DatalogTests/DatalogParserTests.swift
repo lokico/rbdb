@@ -346,3 +346,35 @@ func comparisonGuardRoundTrip() throws {
 		#expect(parsed == reparsed, "round-trip failed for \(source) (printed: \(printed))")
 	}
 }
+
+/// `Formula.description` is what an error message shows, and errors are raised from RBDB, which
+/// knows nothing of this parser. So there are two renderings of a formula in the package, and this is
+/// what keeps them one language: whatever an error prints, the console can be handed straight back.
+@Test("a formula's description is datalog, and parses back as itself")
+func descriptionIsDatalog() throws {
+	let parser = DatalogParser()
+	for source in [
+		"-cousin(mia, henry)",
+		#"p("two words")"#,
+		"p(1.0)",
+		"cousin(X, Y) :- parent(Z, X), parent(W, Y), sibling(Z, W), X != Y",
+		// Arithmetic is where the two renderings differ in *text*: a description parenthesizes an
+		//  expression term (`(X + 1.0) < Y`) where the printer relies on precedence. Both read back the
+		//  same, which is the property being pinned here.
+		"r(X, Y) :- p(X, Y), X + 1 < Y",
+	] {
+		let parsed = try parser.parse(formula: source)
+		#expect(
+			try parser.parse(formula: parsed.description) == parsed,
+			"\(parsed.description) did not parse back as itself")
+	}
+
+	// And where there is no expression to parenthesize, the two agree to the character.
+	for source in [
+		"-cousin(\"asdg b\", \"sakvwe c\")", #"p("two words")"#, "p(1.0)", "q(X) :- p(X), X != 5.0",
+	] {
+		let parsed = try parser.parse(formula: source)
+		#expect(parsed.description == source)
+		#expect(parsed.description == String(try parser.print(formula: parsed)))
+	}
+}

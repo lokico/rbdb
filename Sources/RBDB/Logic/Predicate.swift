@@ -32,6 +32,13 @@ public struct Predicate: Equatable, Comparable, Sendable {
 	}
 }
 
+extension Predicate: CustomStringConvertible {
+	/// Datalog-style surface syntax for this literal.
+	public var description: String {
+		"\(name)(\(arguments.map(\.description).joined(separator: ", ")))"
+	}
+}
+
 extension Predicate: Codable {
 	public func encode(to encoder: Encoder) throws {
 		var container = encoder.unkeyedContainer()

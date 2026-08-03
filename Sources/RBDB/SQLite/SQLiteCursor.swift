@@ -260,8 +260,7 @@ public class SQLiteCursor: Sequence, IteratorProtocol {
 		case SQLITE_DONE:
 			return false
 		default:
-			throw SQLiteError.queryError(
-				"sqlite3_step failed: \(db.lastErrorMessage)", index: statement.sqlIndex)
+			throw SQLiteError.queryError(db.lastErrorMessage, index: statement.sqlIndex)
 		}
 	}
 

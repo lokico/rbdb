@@ -46,6 +46,22 @@ public enum Formula: Symbol {
 	}
 }
 
+extension Formula: CustomStringConvertible {
+	/// Datalog-style surface syntax for this clause.
+	///
+	/// This is written as a bare head where there is no body, `head :- body` otherwise,
+	/// with the guards after the positive literals — the canonical body order.
+	public var description: String {
+		switch self {
+		case .hornClause(positive: let positive, negative: let negatives, guards: let guards):
+			let body = negatives.map(\.description) + guards.map(\.description)
+			return body.isEmpty
+				? positive.description
+				: "\(positive) :- \(body.joined(separator: ", "))"
+		}
+	}
+}
+
 extension SymbolRewriter {
 	public func rewrite(formula: Formula) -> Formula {
 		switch formula {
