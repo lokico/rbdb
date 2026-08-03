@@ -9,6 +9,11 @@ class RBDBCursor: SQLiteCursor {
 	/// is a complete write as far as the relations are concerned.
 	private var savepointOwner: OpaquePointer?
 
+	/// The youngest `_rule` row that predates that statement. Whatever it stores itself is younger, and
+	/// that is how the check tells the newcomer from the culprit here — a statement arrives already
+	/// executed and unparsed, so there is no formula to hand it. See `checkCoherence`.
+	private var writtenAfter: Int64 = 0
+
 	init(_ rbdb: RBDB, sql: SQL) throws {
 		self.rbdb = rbdb
 		try super.init(rbdb, sql: sql)
@@ -42,6 +47,7 @@ class RBDBCursor: SQLiteCursor {
 				//  contradiction it turns out to complete can be undone once we can see it — which is
 				//  only after the write lands. See `checkCoherence`.
 				if savepointOwner == nil && rbdb.writes(statement.ptr, sql: sqlString) {
+					writtenAfter = try rbdb.latestRuleID()
 					try rbdb.beginCoherenceSavepoint()
 					savepointOwner = statement.ptr
 				}
@@ -62,7 +68,7 @@ class RBDBCursor: SQLiteCursor {
 		//  finished and there is nothing settled to check.
 		guard !hasRow, savepointOwner == statement.ptr else { return hasRow }
 		do {
-			try rbdb.checkCoherence()
+			try rbdb.checkCoherence(writtenAfter: writtenAfter)
 		} catch {
 			try? endSavepoint(for: statement.ptr, rollingBack: true)
 			throw error

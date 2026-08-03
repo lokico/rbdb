@@ -61,7 +61,13 @@ extension RBDB {
 	/// literals derivable and cannot create a contradiction. That stops being true once
 	/// negation-as-failure lands: retracting `q(1)` will make `not q(1)` hold, which can derive `-p(1)`
 	/// over a live `p(1)`.
-	func checkCoherence(of formula: Formula? = nil) throws {
+	///
+	/// - Parameter formula: What the caller asserted, where it can say. Never cited as the culprit.
+	/// - Parameter writtenAfter: The id of the youngest `_rule` row that predates this write, for a
+	///   caller that *can't* name what it wrote — a raw SQL statement arrives here already executed and
+	///   unparsed. Anything younger was stored by the write itself and is likewise not the culprit.
+	///   `nil` where the caller took no such reading, and then nothing is treated as new.
+	func checkCoherence(of formula: Formula? = nil, writtenAfter watermark: Int64? = nil) throws {
 		// The check writes nothing, but its queries do reach `rescue` and the materializer, so guard
 		//  against re-entering it the way `refreshDirtyMaterializations` guards against a nested refresh.
 		guard !isCheckingCoherence else { return }
@@ -113,18 +119,29 @@ extension RBDB {
 			case .contradicting(let literals): contradicting = literals
 			}
 
-			// Which of the two to name. Never the formula being asserted: that one is the newcomer, not
-			//  the culprit, and citing it would tell the caller to retract what they just asked for.
+			// Which of the two to name. Never the newcomer: that one is what the caller just wrote, not
+			//  the culprit, and citing it would tell them to retract what they just asked for — a
+			//  retraction that, the write having been rolled back by the time they read it, no longer
+			//  exists to be performed. The `assert` path hands its formula in and it is recognized by
+			//  name; a raw SQL write is recognized by its row being younger than the write itself.
 			//  Among what's left, prefer a live stored row, since that is the one they *can* retract.
-			let eligible = contradicting.filter { $0.formula != asserted }
-			let stored = try eligible.filter(isStored).map(\.formula)
+			var eligible: [Formula] = []
+			var stored: [Formula] = []
+			for literal in contradicting where literal.formula != asserted {
+				let id = try storedID(of: literal)
+				if let id, let watermark, id > watermark { continue }
+				eligible.append(literal.formula)
+				if id != nil { stored.append(literal.formula) }
+			}
 			if let culprit = stored.first {
 				throw CoherenceError.contradiction(contradicts: culprit, derivedFrom: stored)
 			}
 
 			// Both sides here are derived, so there is nothing to hand back to `retract`.
 			//  Hold on to it, but keep scanning in case we find a more useful contradiction.
-			unactionable = unactionable ?? eligible.first?.formula
+			//  The last fallback is for a write that stored *both* sides itself: nothing is eligible,
+			//  but the contradiction is real and still has to be reported.
+			unactionable = unactionable ?? eligible.first ?? contradicting.first?.formula
 		}
 
 		if let unactionable {
@@ -279,16 +296,26 @@ extension RBDB {
 		return Literal(formula: try JSONDecoder().decode(Formula.self, from: data), json: json)
 	}
 
-	/// Whether this literal is itself a live row of `_rule` — something someone asserted, as opposed to a
-	/// conclusion that merely follows.
-	private func isStored(_ literal: Literal) throws -> Bool {
+	/// The live `_rule` row this literal is stored as — something someone asserted, as opposed to a
+	/// conclusion that merely follows, which has no row and so comes back `nil`.
+	///
+	/// The id doubles as *when*: `internal_entity_id` is allocated from `_entity`, which only ever
+	/// grows, so a row younger than a watermark taken before a write is one that write stored.
+	private func storedID(of literal: Literal) throws -> Int64? {
 		try super.query(
 			sql: """
-				SELECT 1 FROM _rule
+				SELECT internal_entity_id AS id FROM _rule
 				WHERE superceded_by IS NULL AND formula = jsonb(\(literal.json))
 				LIMIT 1
 				"""
-		).hasMoreRows
+		).makeIterator().next()?["id"] as? Int64
+	}
+
+	/// The youngest `_rule` row there is, as a mark to tell a subsequent write's rows apart from
+	/// everything that stood before it. Zero when there are none: every id is greater.
+	func latestRuleID() throws -> Int64 {
+		try super.query(sql: "SELECT max(internal_entity_id) AS id FROM _rule")
+			.makeIterator().next()?["id"] as? Int64 ?? 0
 	}
 
 	/// Whether `statement` writes, and so has to be checked for coherence once it completes.
@@ -310,9 +337,13 @@ extension RBDB {
 	}
 
 	/// Ends the savepoint, undoing everything inside it first where asked. `ROLLBACK TO` rewinds without
-	/// popping, so the `RELEASE` is needed either way.
+	/// popping, so the `RELEASE` is needed either way — and it is the whole of the job, not tidying: an
+	/// unpopped savepoint that was the *outermost* one holds open the transaction it implicitly began,
+	/// so the caller's next `BEGIN` fails with "cannot start a transaction within a transaction" and
+	/// whatever they write in the meantime sits in a transaction nobody will commit.
 	func endCoherenceSavepoint(rollingBack: Bool) throws {
-		let sql = (rollingBack ? "ROLLBACK TO " : "RELEASE ") + RBDB.coherenceSavepoint
+		let name = RBDB.coherenceSavepoint
+		let sql = (rollingBack ? "ROLLBACK TO \(name); " : "") + "RELEASE \(name)"
 		try super.query(sql: SQL(sql))
 	}
 }

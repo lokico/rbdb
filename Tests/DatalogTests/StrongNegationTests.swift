@@ -675,6 +675,72 @@ struct StrongNegationTests {
 		}
 	}
 
+	/// Which of the two literals a *raw SQL* write is told about. `assert` knows the formula it was
+	/// handed and filters it out, but an `INSERT` arrives here already executed and unparsed, so the
+	/// newcomer has to be recognized another way — by its `_rule` row being younger than the write.
+	/// Missed, the check names the row the statement just wrote and offers it as the retraction that
+	/// resolves things, which it cannot: the write was rolled back, so that row no longer exists.
+	@Test("an INSERT is never cited as its own culprit", arguments: ["", "-"])
+	func sqlInsertCitesTheOtherSide(_ polarity: String) async throws {
+		let inverse = polarity == "-" ? "" : "-"
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE p(a)")
+		try db.assert(datalog: "\(inverse)p(1)")
+
+		// The name is an identifier, so build the text first: an `SQL` literal would bind it as a `?`.
+		let insert = "INSERT INTO [\(polarity)p] VALUES (1)"
+		let error = #expect(throws: CoherenceError.self) {
+			try db.query(sql: SQL(insert))
+		}
+		guard case .contradiction(let contradicts, let derivedFrom) = error else { return }
+		let culprit = try DatalogParser().parse(formula: "\(inverse)p(1)")
+		#expect(contradicts == culprit, "the standing row is the culprit, not the inserted one")
+		#expect(derivedFrom == [culprit], "and retracting it is what resolves the contradiction")
+	}
+
+	/// The same, where the other side is *derived* and so nothing is retractable at all. Naming the
+	/// inserted row here is worse than saying nothing: it reads as a resolution and is not one.
+	@Test("an INSERT whose other side is derived offers no retraction rather than a false one")
+	func sqlInsertDerivedOtherSideOffersNothing() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE p(a)")
+		try db.query(sql: "CREATE TABLE q(a)")
+		try db.assert(datalog: "q(1)")
+		try db.assert(datalog: "p(X) :- q(X)")
+
+		let error = #expect(throws: CoherenceError.self) {
+			try db.query(sql: "INSERT INTO [-p] VALUES (1)")
+		}
+		guard case .contradiction(let contradicts, let derivedFrom) = error else { return }
+		#expect(
+			contradicts == (try DatalogParser().parse(formula: "p(1)")),
+			"the derived `p(1)` is what the insert collides with")
+		#expect(derivedFrom == nil, "and there is no stored row to hand back")
+	}
+
+	/// A rolled-back statement must leave the connection as it found it. `ROLLBACK TO` rewinds a
+	/// savepoint without popping it, so without the `RELEASE` the coherence savepoint outlives the
+	/// statement — and when it is the outermost one, so does the transaction it implicitly opened. The
+	/// next `BEGIN` then fails with "cannot start a transaction within a transaction", and anything
+	/// written in between is stranded in a transaction nothing will commit.
+	@Test("a rolled-back write leaves no transaction open")
+	func rolledBackWriteLeavesNoTransaction() async throws {
+		let db = try RBDB(path: ":memory:")
+		try db.query(sql: "CREATE TABLE p(a)")
+		try db.assert(datalog: "-p(1)")
+
+		#expect(throws: CoherenceError.self) {
+			try db.query(sql: "INSERT INTO p(a) VALUES (1)")
+		}
+		#expect(sqlite3_get_autocommit(db.db) != 0, "the failed write opened nothing lasting")
+
+		// The revision path is the first thing a caller reaches for after this error, and it opens a
+		//  transaction of its own.
+		try db.retract(datalog: "-p(1)")
+		try db.query(sql: "INSERT INTO p(a) VALUES (1)")
+		#expect(try db.query(datalog: "p(A)").map { Int($0["A"] as! Int64) } == [1])
+	}
+
 	@Test("the check fires on matching arguments only")
 	func sqlInsertNonMatchingArguments() async throws {
 		let db = try RBDB(path: ":memory:")
