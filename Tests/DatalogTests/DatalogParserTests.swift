@@ -7,7 +7,7 @@ func parseSimpleFacts() throws {
 	let parser = DatalogParser()
 
 	// Test simple fact: parent(alice, bob).
-	let result1 = try parser.parse("parent(alice, bob)")
+	let result1 = try parser.parse(formula: "parent(alice, bob)")
 	let expected1 = Formula.hornClause(
 		positive: Predicate(name: "parent", arguments: [.string("alice"), .string("bob")]),
 		negative: []
@@ -15,7 +15,7 @@ func parseSimpleFacts() throws {
 	#expect(result1 == expected1)
 
 	// Test fact with numbers: age(alice, 30)
-	let result2 = try parser.parse("age(alice, 30)")
+	let result2 = try parser.parse(formula: "age(alice, 30)")
 	let expected2 = Formula.hornClause(
 		positive: Predicate(name: "age", arguments: [.string("alice"), .number(30.0)]),
 		negative: []
@@ -23,7 +23,7 @@ func parseSimpleFacts() throws {
 	#expect(result2 == expected2)
 
 	// Test fact with quoted strings: name(1, "Alice Smith")
-	let result3 = try parser.parse("name(1, \"Alice Smith\")")
+	let result3 = try parser.parse(formula: "name(1, \"Alice Smith\")")
 	let expected3 = Formula.hornClause(
 		positive: Predicate(name: "name", arguments: [.number(1.0), .string("Alice Smith")]),
 		negative: []
@@ -36,7 +36,7 @@ func parseFactsWithVariables() throws {
 	let parser = DatalogParser()
 
 	// Test fact with variable: person(X)
-	let result = try parser.parse("person(X)")
+	let result = try parser.parse(formula: "person(X)")
 
 	// Create expected formula with a variable and use canonicalize to compare
 	let expectedVar = Var()
@@ -54,7 +54,7 @@ func parseSimpleRules() throws {
 	let parser = DatalogParser()
 
 	// Test rule: grandparent(X, Z) :- parent(X, Y), parent(Y, Z)
-	let result = try parser.parse("grandparent(X, Z) :- parent(X, Y), parent(Y, Z)")
+	let result = try parser.parse(formula: "grandparent(X, Z) :- parent(X, Y), parent(Y, Z)")
 
 	// Create expected formula with variables and use canonicalize to compare
 	let X = Var()
@@ -77,7 +77,7 @@ func parseMixedRules() throws {
 	let parser = DatalogParser()
 
 	// Test rule: adult(X) :- age(X, 18)
-	let result = try parser.parse("adult(X) :- age(X, 18)")
+	let result = try parser.parse(formula: "adult(X) :- age(X, 18)")
 
 	// Create expected formula and use canonicalize to compare
 	let X = Var()
@@ -102,11 +102,11 @@ func parseWithPeriodsAndWhitespace() throws {
 		positive: Predicate(name: "parent", arguments: [.string("alice"), .string("bob")]),
 		negative: []
 	)
-	#expect(result1 == expected)
+	#expect(result1 == [.assert(expected)])
 
 	// Test with extra whitespace
 	let result2 = try parser.parse("  parent( alice , bob )  .  ")
-	#expect(result2 == expected)
+	#expect(result2 == [.assert(expected)])
 
 	// Test rule with whitespace and period
 	let result3 = try parser.parse("  grandparent(X, Z) :- parent(X, Y) , parent(Y, Z)  .  ")
@@ -124,7 +124,11 @@ func parseWithPeriodsAndWhitespace() throws {
 	)
 
 	// Use canonicalize to compare formulas with variables
-	#expect(result3.canonicalize() == expected3.canonicalize())
+	guard result3.count == 1, result3[0].kind == .assert else {
+		Issue.record("expected a single assertion, got \(result3)")
+		return
+	}
+	#expect(result3[0].formula.canonicalize() == expected3.canonicalize())
 }
 
 @Test("Print simple facts")
@@ -136,7 +140,7 @@ func printSimpleFacts() throws {
 		positive: Predicate(name: "parent", arguments: [.string("alice"), .string("bob")]),
 		negative: []
 	)
-	let printed1 = try parser.print(fact1)
+	let printed1 = try parser.print(formula: fact1)
 	#expect(printed1 == "parent(alice, bob)")
 
 	// Test fact with numbers
@@ -144,7 +148,7 @@ func printSimpleFacts() throws {
 		positive: Predicate(name: "age", arguments: [.string("alice"), .number(30.0)]),
 		negative: []
 	)
-	let printed2 = try parser.print(fact2)
+	let printed2 = try parser.print(formula: fact2)
 	#expect(printed2 == "age(alice, 30.0)")
 
 	// Test fact with quoted strings
@@ -152,7 +156,7 @@ func printSimpleFacts() throws {
 		positive: Predicate(name: "name", arguments: [.number(1.0), .string("Alice Smith")]),
 		negative: []
 	)
-	let printed3 = try parser.print(fact3)
+	let printed3 = try parser.print(formula: fact3)
 	#expect(printed3 == "name(1.0, \"Alice Smith\")")
 }
 
@@ -174,7 +178,7 @@ func printRules() throws {
 		]
 	)
 
-	let printed = try parser.print(rule)
+	let printed = try parser.print(formula: rule)
 	// Variables with IDs 23, 24, 25 should print as X, Y, Z
 	#expect(printed == "grandparent(X, Z) :- parent(X, Y), parent(Y, Z)")
 }
@@ -191,9 +195,9 @@ func roundTripParsingAndPrinting() throws {
 	]
 
 	for factString in factStrings {
-		let parsed = try parser.parse(factString)
-		let printed = try parser.print(parsed)
-		let reparsed = try parser.parse(printed)
+		let parsed = try parser.parse(formula: factString)
+		let printed = try parser.print(formula: parsed)
+		let reparsed = try parser.parse(formula: printed)
 		#expect(parsed == reparsed)
 	}
 }
@@ -204,28 +208,28 @@ func parseArithmeticLowerings() throws {
 	let v = Var()
 
 	// `-` lowers to add with a negated operand: X - 1 → add(X, -1)
-	let minus = try parser.parse("d(X - 1)")
+	let minus = try parser.parse(formula: "d(X - 1)")
 	let minusExpected = Formula.hornClause(
 		positive: Predicate(name: "d", arguments: [Term.difference(.variable(v), .number(1))]),
 		negative: [])
 	#expect(minus.canonicalize() == minusExpected.canonicalize())
 
 	// `/` lowers to multiplication by an inverse: X / 2 → X * 0.5
-	let divide = try parser.parse("d(X / 2)")
+	let divide = try parser.parse(formula: "d(X / 2)")
 	let divideExpected = Formula.hornClause(
 		positive: Predicate(name: "d", arguments: [Term.quotient(.variable(v), .number(2))]),
 		negative: [])
 	#expect(divide.canonicalize() == divideExpected.canonicalize())
 
 	// `^` parses to a power (right-associative).
-	let power = try parser.parse("d(X ^ 2)")
+	let power = try parser.parse(formula: "d(X ^ 2)")
 	let powerExpected = Formula.hornClause(
 		positive: Predicate(name: "d", arguments: [Term.power(.variable(v), .number(2))]),
 		negative: [])
 	#expect(power.canonicalize() == powerExpected.canonicalize())
 
 	// Mixed operators at one precedence level parse correctly: X - 1 + 3 → X + 2
-	let mixed = try parser.parse("d(X - 1 + 3)")
+	let mixed = try parser.parse(formula: "d(X - 1 + 3)")
 	let mixedExpected = Formula.hornClause(
 		positive: Predicate(name: "d", arguments: [Term.sum(.variable(v), .number(2))]),
 		negative: [])
@@ -242,9 +246,9 @@ func arithmeticRoundTrip() throws {
 		"d(2 ^ X ^ 3) :- b(X)",
 		"d(X * Y + 1) :- b(X, Y)",
 	] {
-		let parsed = try parser.parse(source)
-		let printed = try parser.print(parsed)
-		let reparsed = try parser.parse(printed)
+		let parsed = try parser.parse(formula: source)
+		let printed = try parser.print(formula: parsed)
+		let reparsed = try parser.parse(formula: printed)
 		#expect(parsed == reparsed, "round-trip failed for \(source) (printed: \(printed))")
 	}
 }
@@ -254,7 +258,7 @@ func parseFactsWithSingleQuotedStrings() throws {
 	let parser = DatalogParser()
 
 	// Test simple fact with single-quoted string: user('Alice')
-	let result1 = try parser.parse("user('Alice')")
+	let result1 = try parser.parse(formula: "user('Alice')")
 	let expected1 = Formula.hornClause(
 		positive: Predicate(name: "user", arguments: [.string("Alice")]),
 		negative: []
@@ -262,7 +266,7 @@ func parseFactsWithSingleQuotedStrings() throws {
 	#expect(result1 == expected1)
 
 	// Test fact with mixed quotes: name('Alice', "Smith")
-	let result2 = try parser.parse("name('Alice', \"Smith\")")
+	let result2 = try parser.parse(formula: "name('Alice', \"Smith\")")
 	let expected2 = Formula.hornClause(
 		positive: Predicate(name: "name", arguments: [.string("Alice"), .string("Smith")]),
 		negative: []
@@ -270,7 +274,7 @@ func parseFactsWithSingleQuotedStrings() throws {
 	#expect(result2 == expected2)
 
 	// Test fact with only single quotes: person('John', 'Doe')
-	let result3 = try parser.parse("person('John', 'Doe')")
+	let result3 = try parser.parse(formula: "person('John', 'Doe')")
 	let expected3 = Formula.hornClause(
 		positive: Predicate(name: "person", arguments: [.string("John"), .string("Doe")]),
 		negative: []
@@ -284,7 +288,8 @@ func parseComparisonGuard() throws {
 
 	// brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S
 	let result = try parser.parse(
-		"brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S")
+		formula:
+			"brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S")
 
 	let B = Var()
 	let S = Var()
@@ -306,7 +311,9 @@ func parseComparisonOperators() throws {
 	let parser = DatalogParser()
 
 	func guardOf(_ source: String) throws -> BooleanExpression? {
-		guard case .hornClause(_, _, let guards) = try parser.parse(source) else { return nil }
+		guard case .hornClause(_, _, let guards) = try parser.parse(formula: source) else {
+			return nil
+		}
 		return guards.first
 	}
 
@@ -333,9 +340,9 @@ func comparisonGuardRoundTrip() throws {
 		"brother(B, S) :- male(B), parent(X, B), parent(X, S), B != S",
 		"r(X, Y) :- p(X, Y), X + 1 < Y",
 	] {
-		let parsed = try parser.parse(source)
-		let printed = try parser.print(parsed)
-		let reparsed = try parser.parse(printed)
+		let parsed = try parser.parse(formula: source)
+		let printed = try parser.print(formula: parsed)
+		let reparsed = try parser.parse(formula: printed)
 		#expect(parsed == reparsed, "round-trip failed for \(source) (printed: \(printed))")
 	}
 }

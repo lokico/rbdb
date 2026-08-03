@@ -41,7 +41,7 @@ struct StrongNegationTests {
 
 	@Test("a negative head encodes as `@-name`")
 	func encoding() async throws {
-		let formula = try DatalogParser().parse("-p(1)")
+		let formula = try DatalogParser().parse(formula: "-p(1)")
 		#expect(formula.type.stringValue == "@-p")
 
 		let json = try formulaToJSON(formula)
@@ -53,7 +53,7 @@ struct StrongNegationTests {
 
 	@Test("a positive head is unaffected")
 	func positiveEncoding() async throws {
-		let formula = try DatalogParser().parse("p(1)")
+		let formula = try DatalogParser().parse(formula: "p(1)")
 		#expect(formula.type.stringValue == "@p")
 	}
 
@@ -68,13 +68,13 @@ struct StrongNegationTests {
 		])
 	func parserRoundTrip(_ source: String) async throws {
 		let parser = DatalogParser()
-		let formula = try parser.parse(source)
-		#expect(String(try parser.print(formula)) == source)
+		let formula = try parser.parse(formula: source)
+		#expect(String(try parser.print(formula: formula)) == source)
 	}
 
 	@Test("a negative number literal still parses as a number")
 	func negativeNumbersStillParse() async throws {
-		let formula = try DatalogParser().parse("p(-5)")
+		let formula = try DatalogParser().parse(formula: "p(-5)")
 		guard case .hornClause(let head, _, _) = formula else {
 			Issue.record("expected a Horn clause")
 			return
@@ -303,7 +303,7 @@ struct StrongNegationTests {
 		}
 		guard case .contradiction(let contradicts, let derivedFrom) = error else { return }
 		#expect(
-			contradicts == (try DatalogParser().parse("-p(1)")),
+			contradicts == (try DatalogParser().parse(formula: "-p(1)")),
 			"the stored `-p(1)` is the culprit, not the derived `p(1)`")
 		#expect(derivedFrom != nil, "and being stored, it can be named exactly")
 	}
@@ -335,7 +335,7 @@ struct StrongNegationTests {
 			try db.assert(datalog: "-\(stored)(1)")
 		}
 		guard case .contradiction(let contradicts, let derivedFrom) = error else { return }
-		let culprit = try DatalogParser().parse("\(stored)(1)")
+		let culprit = try DatalogParser().parse(formula: "\(stored)(1)")
 		#expect(
 			contradicts == culprit,
 			"the stored `\(stored)(1)` is what the caller can act on; `\(derived)` has no such side"
@@ -371,7 +371,7 @@ struct StrongNegationTests {
 			try db.assert(datalog: "\(inverse)\(name)(1)")
 		}
 		guard case .contradiction(let contradicts, let derivedFrom) = error else { return }
-		let culprit = try DatalogParser().parse("\(polarity)\(name)(1)")
+		let culprit = try DatalogParser().parse(formula: "\(polarity)\(name)(1)")
 		#expect(contradicts == culprit, "the stored fact, not a derived literal of `\(other)`")
 		#expect(derivedFrom == [culprit], "retracting it is what resolves the contradiction")
 	}
@@ -644,7 +644,9 @@ struct StrongNegationTests {
 			Issue.record("expected `.contradiction`, got \(String(describing: error))")
 			return
 		}
-		#expect(contradicts == (try DatalogParser().parse("-p(1)")), "the stored culprit, not `a`")
+		#expect(
+			contradicts == (try DatalogParser().parse(formula: "-p(1)")),
+			"the stored culprit, not `a`")
 	}
 
 	// MARK: - §4.2.2 The SQL surface asks the same question
@@ -827,7 +829,7 @@ struct StrongNegationTests {
 		try db.query(sql: "CREATE TABLE q(a)")
 		try db.assert(datalog: "q(1)")
 
-		let rule = try DatalogParser().parse("-p(X) :- q(X)")
+		let rule = try DatalogParser().parse(formula: "-p(X) :- q(X)")
 		try db.assert(formula: rule)
 
 		let fetched = try db.fetchRules(for: "-p")

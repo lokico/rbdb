@@ -7,8 +7,34 @@ enum ParsingError: Error {
 	case cannotPrintUnparseable(String)
 }
 
+/// One formula plus what to do with it.
+///
+/// A ``DatalogProgram`` is a sequence of these.
+public struct DatalogStep: Equatable {
+	public enum Kind: Character, CaseIterable, Sendable {
+		case query = "?"
+		case assert = "."
+		case retract = "~"
+	}
+	public static func query(_ formula: Formula) -> Self { Self(formula, .query) }
+	public static func assert(_ formula: Formula) -> Self { Self(formula, .assert) }
+	public static func retract(_ formula: Formula) -> Self { Self(formula, .retract) }
+
+	var formula: Formula
+	var kind: Kind
+
+	public init(_ formula: Formula, _ kind: Kind) {
+		self.formula = formula
+		self.kind = kind
+	}
+}
+
+public typealias DatalogProgram = [DatalogStep]
+
 /// Parser for Datalog syntax into RBDB Formula objects.
 public struct DatalogParser: ParserPrinter {
+	/// What a formula with no trailing marker means.
+	let defaultStepKind: DatalogStep.Kind
 
 	private class Context {
 		private var variables: [String: Var] = [:]
@@ -24,13 +50,44 @@ public struct DatalogParser: ParserPrinter {
 	}
 	private let ctx = Context()
 
-	public init() {}
+	public init(defaultStepKind: DatalogStep.Kind = .assert) {
+		self.defaultStepKind = defaultStepKind
+	}
 
-	public var body: some ParserPrinter<Substring, Formula> {
+	public var body: some ParserPrinter<Substring, DatalogProgram> {
+		Whitespace()
+		Many {
+			ParsePrint(.memberwise(DatalogStep.init)) {
+				hornClauseParser
+				Optionally {
+					First().map(.representing(DatalogStep.Kind.self))
+				}.map(.orDefault(defaultStepKind, printIfDefault: true))
+			}
+			Whitespace()
+		} separator: {
+			Always(()).printing("\n")
+		}
+	}
+}
+
+// MARK: - Formula Parser
+
+extension DatalogParser {
+	/// Parses a lone formula — the whole input must be one, with no trailing step marker.
+	public func parse<S: StringProtocol>(formula source: S) throws -> Formula
+	where S.SubSequence == Substring {
+		try formulaParser.parse(source)
+	}
+
+	/// Prints a lone formula, with no trailing step marker.
+	public func print(formula: Formula) throws -> Substring {
+		try formulaParser.print(formula)
+	}
+
+	private var formulaParser: some ParserPrinter<Substring, Formula> {
 		ParsePrint {
 			Whitespace()
 			hornClauseParser
-			Whitespace()
 		}
 	}
 }
@@ -57,9 +114,6 @@ extension DatalogParser {
 					Whitespace().printing(" ".utf8)
 				}
 			}.map(.orDefault(emptyBody))
-
-			// Optional period at the end
-			".".replaceError(with: ())
 		}
 	}
 

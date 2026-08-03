@@ -64,7 +64,7 @@ func datalogSQLiteFunction(
 
 	let text: String
 	do {
-		text = String(try DatalogParser().print(formula))
+		text = String(try DatalogParser().print(formula: formula))
 	} catch {
 		sqlite3_result_error(context, "datalog() failed to print formula: \(error)", -1)
 		return

@@ -684,26 +684,33 @@ func executeCommand(_ command: String, database: RBDB, mode: InputMode) {
 			printTable(results)
 
 		case .datalog(let isQueryMode):
-			if isQueryMode {
-				let results = try database.query(datalog: command)
-				printTable(results)
-			} else {
-				// handle retraction
-				if command.hasSuffix("~") {
-					try database.retract(datalog: String(command.dropLast()))
-					print("Retracted.")
-				} else {
-					try database.assert(datalog: command)
-					print("Asserted.")
+			// Each formula says what it is for — `?`, `.` or `~` — and an unmarked one means whatever
+			//  the prompt is asking for. Writes are tallied rather than announced one by one, because a
+			//  command can be a whole file's worth of them; answers print as they arrive.
+			var asserted = 0
+			var retracted = 0
+			defer {
+				if asserted > 0 { print(asserted == 1 ? "Asserted." : "Asserted \(asserted).") }
+				if retracted > 0 {
+					print(retracted == 1 ? "Retracted." : "Retracted \(retracted).")
+				}
+			}
+
+			let unmarked: DatalogStep.Kind = isQueryMode ? .query : .assert
+			try database.run(datalog: command, default: unmarked) { outcome in
+				switch outcome {
+				case .asserted: asserted += 1
+				case .retracted: retracted += 1
+				case .answered(_, let results): printTable(results)
 				}
 			}
 		}
 	} catch CoherenceError.contradiction(contradicts: let inverse, derivedFrom: let derivedFrom) {
 		let datalog = DatalogParser()
 		print("Error: Contradicts known value:")
-		print("    \((try? datalog.print(inverse)) ?? String(describing: inverse)[...])")
+		print("    \((try? datalog.print(formula: inverse)) ?? String(describing: inverse)[...])")
 		if let derivedFrom = derivedFrom {
-			let retractions = derivedFrom.compactMap { try? datalog.print($0) + "~" }
+			let retractions = derivedFrom.compactMap { try? datalog.print([.retract($0)]) }
 			if !retractions.isEmpty {
 				print("  Resolve with one or more of these retraction(s):")
 				for retraction in retractions {

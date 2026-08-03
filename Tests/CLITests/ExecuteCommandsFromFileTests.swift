@@ -56,6 +56,33 @@ struct ExecuteCommandsFromFileTests {
 		#expect(try predicateNames(database) == ["bar", "foo"])
 	}
 
+	/// A datalog block is flushed to `executeCommand` as one program, so every formula in it has to
+	/// be run as what its own marker says — an unmarked one must not take its meaning from whatever
+	/// the *last* line of the block happens to end with.
+	@Test("every step of a datalog block runs as itself")
+	func datalogBlockRunsEveryStep() async throws {
+		let database = try RBDB(path: ":memory:")
+		let path = try writeTempFile(
+			"""
+			CREATE TABLE p (a);
+			CREATE TABLE q (a);
+			.lang datalog
+			q(1).
+			p(1)
+			q(1)~
+			"""
+		)
+
+		let shouldContinue = try await executeCommandsFromFile(
+			filePath: path, database: database, mode: .sql)
+
+		#expect(shouldContinue == true)
+		#expect(
+			try Array(database.query(datalog: "p(A)?")).count == 1,
+			"the unmarked `p(1)` is an assertion, the block's trailing `~` notwithstanding")
+		#expect(try Array(database.query(datalog: "q(A)?")).isEmpty, "and `q(1)~` retracted `q(1)`")
+	}
+
 	@Test(".exit stops processing the rest of the file and skips interactive mode")
 	func exitLineStopsProcessing() async throws {
 		let database = try RBDB(path: ":memory:")
