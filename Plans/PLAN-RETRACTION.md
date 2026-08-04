@@ -1,5 +1,7 @@
 # Plan: Retraction, supersession, and strong negation
 
+Status: ✅ Implemented in 161947487f56db365d9e1d27a10bcc995690ab02, 310192c1de7700037166e33fc6e0749ef526758d, and aaa925acb887c91a671aafe55f2a6ca2a0d18904
+
 ## Context
 
 RBDB stores every fact and rule as a row in `_rule`. There is currently no way to take one
